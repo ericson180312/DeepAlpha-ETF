@@ -59,11 +59,21 @@ python main.py
 ## 📊 Performance & Visualization
 
 The pipeline will generate two main charts in the root directory:
+1. `baseline_vs_spy_performance.png`: Traditional Momentum vs. SPY.
+2. `ml_vs_baseline_performance.png`: The Ultimate Showdown (Ensemble LSTM vs. Traditional Baseline vs. SPY).
 
-* **`baseline_vs_spy_performance.png`**: Traditional Momentum vs. SPY.
-* **`ml_vs_baseline_performance.png`**: The Ultimate Showdown (Ensemble LSTM vs. Traditional Baseline vs. SPY).
+### 🏆 Out-of-Sample Performance Report (12 Trading Months)
+Below is a recent out-of-sample backtest result demonstrating the AI's risk management capabilities. 
 
-> **Note:** The Ensemble LSTM strategy typically demonstrates superior downside protection (drastically lower Max Drawdown) and a higher Sharpe Ratio during out-of-sample testing compared to traditional unhedged momentum.
+| Strategy | CAGR | Max Drawdown | Sharpe Ratio |
+| :--- | :--- | :--- | :--- |
+| **🤖 Ensemble LSTM AI (Top 5)** | **41.15%** | **-3.63%** | **2.93** |
+| 📈 Traditional Momentum (Top 5)| 48.00% | -9.21% | 2.57 |
+| 🏛️ SPY Benchmark | 31.08% | -5.76% | 2.10 |
+<img width="1600" height="1000" alt="ml_vs_baseline_performance" src="https://github.com/user-attachments/assets/8066a828-76e7-47f7-8314-81abab8b1f2d" />
+
+> **💡 Quantitative Insight:** > While the Traditional Momentum strategy captured higher absolute returns (48.00%) during a strong bull market, it suffered a significant drawdown (-9.21%). The **Ensemble LSTM AI** intelligently sacrificed a portion of the extreme upside to provide **massive downside protection (Max Drawdown of only -3.63%)**, ultimately achieving a vastly superior risk-adjusted return (**Sharpe Ratio: 2.93**).
+
 
 ## 🧠 Model Architecture (MomentumLSTM)
 
