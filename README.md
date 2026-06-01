@@ -6,7 +6,7 @@
 
 DeepAlpha-ETF is an end-to-end quantitative trading pipeline that applies **Deep Learning (Ensemble LSTM)** and **Macroeconomic Feature Engineering** to optimize ETF rotation strategies. It aims to outperform traditional momentum strategies by dynamically adjusting risk exposure and predicting excess returns (Alpha) based on market volatility and trend conditions.
 
-## ✨ Key Features
+## Key Features
 
 * **Macro-Aware Feature Engineering:** Integrates global market features (SPY 200-day MA deviation, rolling volatility) with local ETF features (momentum, volatility) to give the model a holistic view of the market regime.
 * **Targeting Alpha:** Instead of predicting absolute returns, the model is trained to predict **Excess Return (Alpha)** against the SPY benchmark, naturally forcing it to seek outperforming assets.
@@ -14,7 +14,7 @@ DeepAlpha-ETF is an end-to-end quantitative trading pipeline that applies **Deep
 * **Signal-Weighted Allocation:** Automatically drops assets with negative expected Alpha and dynamically allocates capital proportionally to positive Alpha scores, effectively acting as an automated de-leveraging mechanism during market crashes.
 * **Strict Out-of-Sample (OOS) Backtesting:** Completely isolates the test set from the training and validation sets, eliminating Look-Ahead Bias.
 
-## 🗂️ Project Structure
+## Project Structure
 
 The project is modularized for easy maintenance and execution. All hyper-parameters are centrally managed.
 
@@ -32,7 +32,7 @@ DeepAlpha-ETF/
 
 ```
 
-## 🚀 Getting Started
+## Getting Started
 
 ### 1. Prerequisites
 
@@ -56,7 +56,7 @@ python main.py
 
 ```
 
-## 📊 Performance & Visualization
+## Performance & Visualization
 
 The pipeline will generate two main charts in the root directory:
 1. `baseline_vs_spy_performance.png`: Traditional Momentum vs. SPY.
@@ -75,7 +75,7 @@ Below is a recent out-of-sample backtest result demonstrating the AI's risk mana
 > **💡 Quantitative Insight:** > While the Traditional Momentum strategy captured higher absolute returns (48.00%) during a strong bull market, it suffered a significant drawdown (-9.21%). The **Ensemble LSTM AI** intelligently sacrificed a portion of the extreme upside to provide **massive downside protection (Max Drawdown of only -3.63%)**, ultimately achieving a vastly superior risk-adjusted return (**Sharpe Ratio: 2.93**).
 
 
-## 🧠 Model Architecture (MomentumLSTM)
+## Model Architecture (MomentumLSTM)
 
 * **Input Layer:** Processes time-series sequences (default: 60 days lookback).
 * **LSTM Layer:** Captures temporal dependencies in price and macro data.
@@ -84,6 +84,6 @@ Below is a recent out-of-sample backtest result demonstrating the AI's risk mana
 * **Dropout:** Applied at 30% to prevent overfitting.
 * **Loss Function:** HuberLoss to provide robustness against extreme market outliers (fat tails).
 
-## ⚠️ Disclaimer
+## Disclaimer
 
 This project is for educational and research purposes only. It does not constitute financial advice. Historical performance is not indicative of future results. Trading in financial markets involves significant risk of loss. Always test algorithms thoroughly in a paper-trading environment before deploying real capital.
