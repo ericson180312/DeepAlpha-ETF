@@ -45,7 +45,7 @@ def generate_ml_features(df):
         features[f'{col}_Mom_60d'] = data[col].pct_change(60)
 
         features[f'{col}_Mom_120d'] = data[col].pct_change(120)
-        features[f'{col}_Mom_240d'] = data[col].pct_change(240)
+        # features[f'{col}_Mom_240d'] = data[col].pct_change(240)
         
     # ==========================================
     # 🌟 關鍵修改：預測目標 (Target) 改為「超額報酬 (Excess Return)」

@@ -59,9 +59,9 @@ def backtest_momentum_strategy(df, mom_score, top_n):
             # 3. 依照 Alpha 分數比例分配權重
             if not positive_scores.empty:
                 # 計算剩餘標的之 Alpha 總和
-                total_alpha = positive_scores.sum() + positive_scores.count()
+                total_alpha = positive_scores.sum() + positive_scores.count() / 2.0  # 加上 0.5 的平滑項
                 # 算出每檔標的應分配的權重 (如 0.0182 / 0.0253 = 71.9%)
-                proportional_weights = (positive_scores + 1) / total_alpha
+                proportional_weights = (positive_scores + 0.5) / total_alpha
                 
                 # 將權重寫入矩陣
                 weights.loc[date, positive_scores.index] = proportional_weights
