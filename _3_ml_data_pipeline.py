@@ -19,9 +19,13 @@ from torch.utils.data import Dataset, DataLoader
 # ==========================================
 # 1. 特徵工程模組 (Feature Engineering)
 # ==========================================
-def generate_ml_features(df, horizon=_config.TARGET_HORIZON):
+def generate_ml_features(df, horizon=_config.TARGET_HORIZON, require_all_assets=True):
     """
     回傳 (X, Y)，索引相同。X 為所有特徵齊全的日子；Y 對齊 X，尾端尚未實現的 target 為 NaN。
+
+    require_all_assets=False 為 PIT 模式：只要求全域總經特徵齊全，**保留個別標的的 NaN**
+    (那代表該標的當時尚未有足夠歷史)。此時 X 會含 NaN，只有 pooled 表徵能用——
+    固定池的 LSTM 假設 13 個輸出恆存在，不適用。
     """
     print("⚙️ 開始進行特徵工程 (總經趨勢 + 個體動能, target = 相對 SPY 的超額報酬)...")
 
@@ -51,20 +55,25 @@ def generate_ml_features(df, horizon=_config.TARGET_HORIZON):
             asset_future_ret = data[col].pct_change(horizon).shift(-horizon)
             targets[f'{col}_Target'] = asset_future_ret - spy_future_ret
 
-    X = features.dropna()
+    if require_all_assets:
+        X = features.dropna()
+    else:
+        # PIT：只要求總經特徵齊全 (SPY 的 200MA 與 20 日波動)
+        X = features[features[['Global_SPY_Trend_200', 'Global_SPY_Vol_20d']].notna().all(axis=1)]
     Y = targets.reindex(X.index)
 
-    print(f"✅ 特徵工程完成！X: {X.shape} ({X.index[0].date()} ~ {X.index[-1].date()}), "
-          f"Y 已實現: {int(Y.notna().all(axis=1).sum())} 筆")
+    mode = "固定池" if require_all_assets else "PIT"
+    print(f"✅ 特徵工程完成 ({mode})！X: {X.shape} ({X.index[0].date()} ~ {X.index[-1].date()}), "
+          f"Y 完整已實現: {int(Y.notna().all(axis=1).sum())} 筆")
     return X, Y
 
 
 # ==========================================
 # 2. Walk-forward fold 定義
 # ==========================================
-def fold_specs(X, test_starts=_config.WF_TEST_STARTS):
+def fold_specs(X, test_starts=None):
     """把設定檔的 test 起點清單展開成 [(name, test_start, test_end), ...]，最後一個 fold 到資料尾端。"""
-    starts = [pd.Timestamp(s) for s in test_starts]
+    starts = [pd.Timestamp(s) for s in (_config.WF_TEST_STARTS if test_starts is None else test_starts)]
     ends = starts[1:] + [X.index[-1] + pd.Timedelta(days=1)]
     return [(f"test_{s.date()}", s, e) for s, e in zip(starts, ends)]
 
@@ -72,7 +81,8 @@ def fold_specs(X, test_starts=_config.WF_TEST_STARTS):
 def make_fold(X, Y, test_start, test_end,
               val_months=_config.WF_VAL_MONTHS,
               horizon=_config.TARGET_HORIZON,
-              seq_length=_config.SEQ_LENGTH):
+              seq_length=_config.SEQ_LENGTH,
+              min_targets=None):
     """
     建立一個 fold：回傳 dict，含各 segment 的樣本位置 (X 的整數列索引)、標準化參數與標準化後的 X。
 
@@ -81,12 +91,16 @@ def make_fold(X, Y, test_start, test_end,
       train: [seq_length-1, v0 - horizon)   且 Y 已實現   ← purge 尾端 horizon 個樣本
       val  : [v0, t0 - horizon)             且 Y 已實現   ← purge 尾端 horizon 個樣本，early stopping 看不到 test 期報酬
       test : [t0, t1)                        (Y 可為 NaN；推論不需要 Y)
+
+    min_targets=None 時要求該日所有標的的 target 都已實現 (固定池)；
+    給整數時只要求至少這麼多個標的已實現 (PIT 池：當時還沒上市的標的本來就沒有 target)。
     """
     idx = X.index
     t0 = int(idx.searchsorted(test_start))
     t1 = int(idx.searchsorted(test_end))
     v0 = int(idx.searchsorted(test_start - pd.DateOffset(months=val_months)))
-    y_ok = Y.notna().all(axis=1).values
+    y_ok = (Y.notna().all(axis=1) if min_targets is None
+            else Y.notna().sum(axis=1) >= min_targets).values
 
     def positions(lo, hi, need_y=True):
         pos = np.arange(max(lo, seq_length - 1), max(hi, 0))

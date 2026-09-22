@@ -51,16 +51,33 @@ def calculate_momentum_features(df, windows=None, verbose=True):
 # ==========================================
 # 3. 權重與回測
 # ==========================================
-def build_weights(score_df, top_n, min_score=0.0, fallback=None):
+def slots_for_width(k, top_fraction=None, min_top_n=None):
+    """
+    橫斷面寬度 K -> 該月持股數。PIT 池的寬度會隨時間變動，固定 Top N 會讓早期過度集中
+    (K=6 取 5 檔等於幾乎全買)，所以持股數按比例縮放。TOP_FRACTION=5/13 時 K=13 還原 Top 5。
+    """
+    top_fraction = _config.TOP_FRACTION if top_fraction is None else top_fraction
+    min_top_n = _config.PIT_MIN_TOP_N if min_top_n is None else min_top_n
+    return max(min_top_n, int(np.floor(top_fraction * k + 0.5)))
+
+
+def build_weights(score_df, top_n=None, min_score=0.0, fallback=None,
+                  top_fraction=None, min_assets=None, min_top_n=None):
     """
     分數矩陣 (日或月頻) -> 以決策日 (日曆月底) 為索引的權重矩陣。
 
-    - 每個決策日取分數最高的 top_n 檔，每檔佔 1/top_n。
+    - 固定池：給定 top_n (int)，每個決策日取分數最高的 top_n 檔，每檔佔 1/top_n。
+    - PIT 池：top_n=None 且給 top_fraction，則每月持股數 = slots_for_width(當月有效檔數)，
+      並要求有效檔數 >= min_assets 才交易。
     - 分數 <= min_score 的槽位不持有該標的：fallback=None 時留作現金 (權重 0)，
       否則把該槽位配置到 fallback 標的 (例如預測 alpha <= 0 就改持 SPY，與「alpha 相對 SPY」的目標定義一致)。
     - SPY 只作為 fallback，不參與排名。
-    - 有效分數不足 top_n 的決策日整列為 NaN，代表「尚無訊號」——與「有訊號但選擇空手」(整列 0) 區分開。
+    - 有效分數不足門檻的決策日整列為 NaN，代表「尚無訊號」——與「有訊號但選擇空手」(整列 0) 區分開。
     """
+    if top_n is None and top_fraction is None:
+        raise ValueError("top_n 與 top_fraction 至少要給一個")
+    threshold = min_assets if min_assets is not None else (top_n if top_n is not None else _config.PIT_MIN_ASSETS)
+
     monthly_scores = score_df.resample('ME').last()
     ranking = monthly_scores.drop(columns=['SPY'], errors='ignore')
     columns = list(ranking.columns) + ([fallback] if fallback is not None and fallback not in ranking.columns else [])
@@ -68,14 +85,16 @@ def build_weights(score_df, top_n, min_score=0.0, fallback=None):
 
     for date, row in ranking.iterrows():
         valid = row.dropna()
-        if len(valid) < top_n:
+        if len(valid) < threshold:
             continue
+        n = top_n if top_n is not None else slots_for_width(len(valid), top_fraction, min_top_n)
+        n = min(n, len(valid))
         weights.loc[date] = 0.0
-        selected = valid.nlargest(top_n)
+        selected = valid.nlargest(n)
         kept = selected[selected > min_score]
         if len(kept):
-            weights.loc[date, kept.index] = 1.0 / top_n
-        residual = (top_n - len(kept)) / top_n
+            weights.loc[date, kept.index] = 1.0 / n
+        residual = (n - len(kept)) / n
         if fallback is not None and residual > 0:
             weights.loc[date, fallback] += residual
     return weights
@@ -124,14 +143,17 @@ def constant_weights(assets, index, weight=None):
     return pd.DataFrame(w, index=index, columns=list(assets))
 
 
-def backtest_momentum_strategy(df, score_df, top_n, min_score=0.0, fallback=None, cost_bps=0.0):
+def backtest_momentum_strategy(df, score_df, top_n=None, min_score=0.0, fallback=None, cost_bps=0.0,
+                               top_fraction=None, min_assets=None, min_top_n=None):
     """
     月底換股回測。回傳 (以持有月為索引的淨報酬, 以決策日為索引的權重)。
     本月底的權重乘上「下個月」的報酬 (shift(1))，避免未來函數。
+    top_n=None 且給 top_fraction 時走 PIT 模式 (持股數隨橫斷面寬度縮放)。
     """
-    print(f"🔄 執行月底換股回測 (Top {top_n}, min_score={min_score}, fallback={fallback or '現金'}, cost={cost_bps} bps)...")
+    label = f"Top {top_n}" if top_n is not None else f"Top {top_fraction:.3f}×K (min {min_assets or _config.PIT_MIN_ASSETS} 檔)"
+    print(f"🔄 執行月底換股回測 ({label}, min_score={min_score}, fallback={fallback or '現金'}, cost={cost_bps} bps)...")
     monthly_returns, _ = month_end_returns(df)
-    weights = build_weights(score_df, top_n, min_score, fallback)
+    weights = build_weights(score_df, top_n, min_score, fallback, top_fraction, min_assets, min_top_n)
 
     w = weights.reindex(monthly_returns.index).shift(1)      # 決策日 -> 持有月
     cols = w.columns.intersection(monthly_returns.columns)

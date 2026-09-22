@@ -49,6 +49,10 @@ def to_panel(X, assets):
     panel = pd.concat(frames, axis=1)
     panel.index.names = ['date', 'asset']
 
+    # PIT：特徵不齊的 (date, asset) 代表該標的當時歷史不足，整列剔除。
+    # 必須在 z-score 之前剔除，否則橫斷面統計量會被不存在的標的污染。
+    panel = panel.dropna()
+
     # 同一日橫斷面的 z-score：模型要比較的是「這檔相對於今天其他檔」，不是絕對水準
     grouped = panel.groupby(level='date')
     z = (panel - grouped.transform('mean')) / (grouped.transform('std') + 1e-8)

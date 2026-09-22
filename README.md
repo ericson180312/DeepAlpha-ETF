@@ -13,10 +13,12 @@ ability (monthly rank-IC −0.01, t = −0.16), is not better than a ridge regre
 net-of-cost Sharpe sits at the 10th percentile of random 5-of-13 selection. Simple 3/6/12-month momentum has a
 rank-IC of +0.11 (t = 2.1) and a Sharpe at the 98th percentile of the same null.
 
-Three pre-registered rounds have now been run, each committed and pushed before it was executed:
+Four pre-registered rounds have now been run, each committed and pushed before it was executed:
 **round 1** rejected the ensemble LSTM, **round 2** confirmed the momentum baseline is a plateau rather
-than a lucky parameter, and **round 3** rejected a pooled cross-sectional LightGBM that was built
-specifically to fix the LSTM's structural flaw. Details below.
+than a lucky parameter, **round 3** rejected a pooled cross-sectional LightGBM built specifically to fix
+the LSTM's structural flaw, and **round 4** retested everything on a point-in-time universe with three
+times the sample — where momentum's ranking ability finally clears significance (t = 2.9 over 163
+months and five stress episodes) while neither ML model beats it. Details below.
 
 ## What the pipeline does
 
@@ -32,6 +34,8 @@ specifically to fix the LSTM's structural flaw. Details below.
 | 7 | `_7_momentum_robustness.py` | Neighbourhood check on the momentum baseline — plateau or lone peak? — judged against `_config.PRE_REGISTRATION_MOMENTUM` |
 | 4c | `_4c_pooled_gbdt.py` | Pooled (date, asset) representation with no asset identity; LightGBM and a pooled ridge on the same rows |
 | 8 | `_8_pooled_diagnostics.py` | Verdict for the pooled round against `_config.PRE_REGISTRATION_POOLED`; the bar is plain momentum |
+| 1b | `_1b_fetch_pit_data.py` | Point-in-time data: keeps pre-inception NaN, derives the eligibility mask |
+| 9 | `_9_pit_diagnostics.py` | Round 4 — the same models retested on ~3x the sample, judged against `_config.PRE_REGISTRATION_PIT` |
 
 `main.py` runs them in order (about 6 minutes on a GPU). All parameters live in `_config.py`.
 `pytest tests/` runs 37 tests covering the accounting and the walk-forward split; every expected value
@@ -168,6 +172,54 @@ the protocol exists to prevent; it would need its own pre-registered round.
 
 ![pooled](pooled_report.png)
 
+### Round 4: the same models on three times the sample
+
+Every earlier round ended with the same honest declaration — with SE 0.48 across 55 months, the noise
+floor hides almost any real effect. Round 4 pulls the one remaining lever, the sample, and changes
+nothing else. Instead of proxying the four funds that launched in 2019, the universe becomes
+**point-in-time**: at each decision date, rank only the assets that already had 252 trading days of
+history. Holdings scale with width (5/13 of the universe, reproducing Top 5 exactly at K=13). No proxy
+series anywhere — the two funds that matter most for the diversification story are the two that proxy
+worst, and backfilled index series carry no fees, spread or tracking error, which would flatter a
+momentum signal precisely where this project is most sensitive.
+
+That takes the sample from 55 to **163 out-of-sample months (2013-02 to 2026-08)**, SE from 0.48 to
+0.28, and stress episodes from one to five. Rank-IC is made comparable across a universe that grows
+from 6 to 13 assets by testing on the width-adjusted statistic z = IC × √(K−1), fixed in advance.
+
+| | Weighted rank-IC | t(z) | Hit | CAGR | Max DD | Sharpe ± SE | Null percentile |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| **Momentum** | +0.100 | **2.86** | 63% | 13.9% | −13.1% | **1.10 ± 0.28** | **100%** |
+| Pooled GBDT | +0.119 | 3.61 | 64% | 12.6% | −23.9% | 0.79 ± 0.27 | 83% |
+| Pooled ridge | +0.097 | 2.42 | 55% | 11.8% | −22.0% | 0.74 ± 0.27 | 71% |
+| SPY | — | — | — | 14.7% | −23.9% | 0.93 ± 0.28 | — |
+| Equal-weight (PIT) | — | — | — | 8.0% | −14.4% | 0.77 ± 0.27 | — |
+
+| Criterion | Rule | Result |
+| :--- | :--- | :--- |
+| A — momentum survives | weighted IC > 0 and t(z) > 2 | **Passes** (+0.100, t 2.86) |
+| B — momentum vs null | null percentile ≥ 95% | **Passes** (100th percentile) |
+| C — ML wins | paired t(z) > 2 **and** ΔSharpe ≥ 1 SE | **Fails** for both (ridge t −0.38, GBDT t +0.45; both Sharpe ~1.2 SE *worse*) |
+| D — regime | per-year and crisis-year subsets reported | see below |
+| E — narrow/wide split | same sign in K ≤ 8 and K > 8 | momentum and GBDT consistent; **pooled ridge flips** (t −2.41 narrow, +4.18 wide) |
+| F — materiality | difference ≥ 0.5 SE | both ML models differ materially — in the wrong direction |
+
+**This is the first time anything in this repo clears significance on a large sample, and it is the
+three-line rule.** Momentum's advantage is also not where the original README claimed: its CAGR is
+*below* SPY's (13.9% vs 14.7%), and the entire Sharpe advantage comes from a shallower drawdown
+(−13.1% vs −23.9%). Across the five pre-specified stress years the ranking is momentum +0.25, ridge
++0.11, GBDT +0.03, SPY −0.03, equal-weight −0.05 — the defensive story holds, the return story does not.
+
+Two results worth not smoothing over. **The pooled GBDT has the best rank-IC of anything tested
+(+0.119, t 3.61) and still loses at the portfolio level** (0.79 vs 1.10). Rank-IC scores the whole
+cross-section; the portfolio only buys the top ~38% of it, so a model can rank the middle better and
+the top worse. Reporting only the IC table would have produced the opposite conclusion. And **pooled
+ridge fails criterion E outright**: its ranking ability is significantly *negative* in the narrow-universe
+years and strongly positive in the wide ones, so its aggregate +0.097 is an average across a sign flip,
+not a stable effect.
+
+![pit](pit_report.png)
+
 ### What this means
 
 * The model has 36,685 parameters and, in the first fold, 166 overlapping daily samples (about 8 independent months).
@@ -198,9 +250,15 @@ the protocol exists to prevent; it would need its own pre-registered round.
   decimal places.
 * The 13 ETFs, the 20-day target horizon, the 10 bps cost and the monthly rebalance are all fixed
   assumptions that have not been varied. Only the momentum windows and TOP_N have been stress-tested.
-* Three model families have now been rejected on the same 55 months. That is evidence about this
-  sample, not a general claim about machine learning on ETF rotation. With SE 0.48, a true edge of
-  0.3 Sharpe would very likely go undetected here.
+* Round 4's longer sample carries a confound that cannot be removed: the early universe has six assets
+  and a different composition (no commodities, no international, no small-cap value, no managed
+  futures). A difference against rounds 1–3 could come from the extra sample or from the changed mix.
+  The 2022-onward control track inside the same pipeline is reported for exactly this reason.
+* Three ML families have now been rejected, on 55 months and again on 163. That is evidence about this
+  universe and this horizon, not a general claim about machine learning. With SE 0.28 a true edge of
+  0.14 Sharpe would still go undetected.
+* BIL sits in the rankable universe *and* serves as the risk-free proxy, so in the narrow-universe
+  years "momentum picks BIL" means "hold cash" — selection and timing are entangled there.
 
 ## Getting started
 
