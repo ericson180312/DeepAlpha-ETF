@@ -168,7 +168,7 @@ def plot_report(ics, fold_starts, null_df, marks, seed_sharpes, out_path):
     ax.set_xlabel('Ensemble member (sorted by OOS Sharpe)', color=P['ink2'])
     ax.set_ylabel('Annualised Sharpe (OOS)', color=P['ink2'])
     ax.set_title(f'Dispersion across {len(vals)} seeds: range {vals.max() - vals.min():.2f}', color=P['ink'], loc='left')
-    ax.legend(loc='upper left', frameon=False, fontsize=9)
+    ax.legend(loc='center right', frameon=False, fontsize=9)
 
     fig.subplots_adjust(top=0.94, bottom=0.07, left=0.06, right=0.98)
     fig.savefig(out_path, dpi=120, facecolor=P['surface'])
