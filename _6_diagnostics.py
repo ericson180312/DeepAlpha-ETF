@@ -24,7 +24,8 @@ import matplotlib.pyplot as plt
 from scipy.stats import spearmanr
 
 import _config
-from _2_baseline_performance import calculate_momentum_features, backtest_momentum_strategy
+from _2_baseline_performance import (calculate_momentum_features, backtest_momentum_strategy,
+                                     month_end_returns, traded_fraction, performance_metrics as perf)
 from _3_ml_data_pipeline import generate_ml_features
 from _5_strategy_backtest import generate_ml_scores
 
@@ -48,19 +49,6 @@ def quiet():
 # ==========================================
 # 1. 時間軸與分段
 # ==========================================
-def month_end_returns(df):
-    """
-    日資料 -> 以日曆月底為索引的月報酬。
-    若資料最後一天不是該月最後一個營業日，視為不完整月份並剔除 (回傳 flag 供印出)。
-    """
-    last = df.index[-1]
-    complete = pd.offsets.BMonthEnd().rollforward(last) == last
-    px = df.resample('ME').last()
-    if not complete:
-        px = px.iloc[:-1]
-    return px.pct_change(), complete
-
-
 def split_boundaries(X):
     """回傳 (val_start, test_start)，與 _3_ml_data_pipeline.prepare_dataloaders 的切法一致。"""
     n = len(X)
@@ -113,46 +101,8 @@ def ic_summary(ic, seg):
 
 
 # ==========================================
-# 3. 報酬序列 (現金月計 0%) 與績效
+# 3. 統計不確定性
 # ==========================================
-def valid_weights(weights, scores_m, top_n):
-    """
-    只保留「有足夠有效分數」的決策日；其餘設為 NaN。
-    這樣「尚無訊號 (動能需 252 天)」與「有訊號但選擇空手 (權重全 0)」才分得開。
-    """
-    ok = (scores_m.notna().sum(axis=1) >= top_n).reindex(weights.index).fillna(False)
-    return weights.mul(ok.map({True: 1.0, False: np.nan}), axis=0)
-
-
-def holding_returns(w_valid, month_ret):
-    """決策日權重 -> 持有月報酬。權重全 0 的月份得到 0%（現金），沒有決策的月份為 NaN 並剔除。"""
-    w = w_valid.reindex(month_ret.index).shift(1)
-    cols = w.columns.intersection(month_ret.columns)
-    port = (w[cols] * month_ret[cols]).sum(axis=1, min_count=1)
-    return port.dropna()
-
-
-def traded_fraction(w_valid, month_ret):
-    """每個持有月對應的成交金額比例 Σ|Δw| (首月為建倉 = 1.0)，用於交易成本敏感度。"""
-    wv = w_valid.dropna(how='all')
-    traded = wv.diff().abs().sum(axis=1)
-    traded.iloc[0] = wv.iloc[0].abs().sum()
-    return traded.reindex(month_ret.index).shift(1)
-
-
-def perf(r, rf=None):
-    """CAGR、MDD、年化 Sharpe 及其標準誤 (Lo 2002 的 iid 近似)。rf 給定時 Sharpe 用超額報酬算。"""
-    r = r.dropna()
-    cum = (1 + r).cumprod()
-    cagr = cum.iloc[-1] ** (12 / len(r)) - 1
-    mdd = (cum / cum.cummax() - 1).min()
-    ex = r if rf is None else (r - rf.reindex(r.index)).dropna()
-    sr_m = ex.mean() / ex.std(ddof=1)
-    return {'n': len(r), 'CAGR': cagr, 'MDD': mdd,
-            'Sharpe': sr_m * np.sqrt(12),
-            'Sharpe_SE': np.sqrt((1 + 0.5 * sr_m ** 2) / len(ex)) * np.sqrt(12)}
-
-
 def bootstrap_sharpe_ci(r, n_boot, rng, level=0.95):
     """iid bootstrap 的年化 Sharpe 信賴區間。月數很少時區間會很寬——那正是重點。"""
     x = r.dropna().values
@@ -335,12 +285,8 @@ if __name__ == "__main__":
 
     # --- (2) 報酬序列 (現金月計 0%) ---
     with quiet():
-        _, ml_w = backtest_momentum_strategy(df, ml_daily, top_n=top_n)
-        _, base_w = backtest_momentum_strategy(df, mom_daily, top_n=top_n)
-    ml_wv = valid_weights(ml_w, ml_m, top_n)
-    base_wv = valid_weights(base_w, mom_m, top_n)
-    ml_r = holding_returns(ml_wv, month_ret)
-    base_r = holding_returns(base_wv, month_ret)
+        ml_r, ml_w = backtest_momentum_strategy(df, ml_daily, top_n, _config.ML_MIN_SCORE, _config.ML_FALLBACK, cost_bps=0)
+        base_r, base_w = backtest_momentum_strategy(df, mom_daily, top_n, _config.BASE_MIN_SCORE, _config.BASE_FALLBACK, cost_bps=0)
 
     # 持有月的分段 = 其決策日 (前一個月底) 的分段
     seg_hold = segment_of(ml_r.index - pd.offsets.MonthEnd(1), val_start, test_start)
@@ -415,9 +361,8 @@ if __name__ == "__main__":
     seed_rows = {}
     for p, sc in seed_scores.items():
         with quiet():
-            _, w = backtest_momentum_strategy(df, sc, top_n=top_n)
-        r = holding_returns(valid_weights(w, sc.resample('ME').last(), top_n), month_ret).reindex(oos_idx).dropna()
-        seed_rows[p] = perf(r)
+            r, _ = backtest_momentum_strategy(df, sc, top_n, _config.ML_MIN_SCORE, _config.ML_FALLBACK, cost_bps=0)
+        seed_rows[p] = perf(r.reindex(oos_idx).dropna())
     seed_tab = pd.DataFrame(seed_rows).T[['CAGR', 'MDD', 'Sharpe']]
     print(seed_tab.describe().loc[['min', '25%', '50%', '75%', 'max']]
           .to_string(formatters=fmt, float_format=lambda v: f"{v:.2f}"))
@@ -428,8 +373,8 @@ if __name__ == "__main__":
     print("\n" + "-" * 60)
     print("💸 (5) 換手率與交易成本敏感度（OOS；成本 = 成交金額 × bps）")
     print("-" * 60)
-    ml_traded = traded_fraction(ml_wv, month_ret).reindex(oos_idx)
-    base_traded = traded_fraction(base_wv, month_ret).reindex(oos_idx)
+    ml_traded = traded_fraction(ml_w).reindex(month_ret.index).shift(1).reindex(oos_idx)
+    base_traded = traded_fraction(base_w).reindex(month_ret.index).shift(1).reindex(oos_idx)
     print(f"   平均單邊月換手: ML {ml_traded.mean() / 2:.1%} | Baseline {base_traded.mean() / 2:.1%}")
     cost_rows = []
     for bps in _config.COST_GRID_BPS:
@@ -464,5 +409,5 @@ if __name__ == "__main__":
     print(f"  • OOS 只有 {len(oos_idx)} 個月、單一 regime（SPY 同期 CAGR {perf_tab.loc[('test (OOS)', 'SPY'), 'CAGR']:.1%}）。")
     print(f"  • 標的池 {len(assets)} 檔為事後自選，期間止於資料抓取日；兩者都會灌水。")
     print("  • 若 test set 曾在 V1→V2 之間被看過，它就是第二個 validation set，上面的 OOS 數字要再打折。")
-    print("  • _5 的回測未計交易成本；上表 (5) 是唯一納入成本的地方。")
+    print(f"  • 上表 (2)(3)(4) 為毛報酬；_5 的正式回測扣 {_config.COST_BPS} bps，成本敏感度見 (5)。")
     print("\n💾 已儲存: diagnostics_summary.csv, diagnostics_ic_monthly.csv, diagnostics_report.png")

@@ -82,7 +82,7 @@ def train_model(model, train_loader, val_loader, epochs=60, learning_rate=0.001,
     model = model.to(device)
     
     # 使用 Huber Loss 對極端離群值更具魯棒性
-    criterion = nn.HuberLoss(delta=1.0)
+    criterion = nn.HuberLoss(delta=_config.HUBER_DELTA)
     optimizer = optim.Adam(model.parameters(), lr=learning_rate, weight_decay=1e-4) 
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5)
     

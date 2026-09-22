@@ -13,7 +13,7 @@ import _config
 import matplotlib.pyplot as plt
 from _3_ml_data_pipeline import generate_ml_features  # 引入寫好的特徵工程
 from _4_lstm_model import MomentumLSTM                 # 引入模型架構
-from _2_baseline_performance import backtest_momentum_strategy, calculate_performance_metrics
+from _2_baseline_performance import backtest_momentum_strategy, calculate_performance_metrics, month_end_returns
 
 # ==========================================
 # 1. 執行 LSTM 集成模型推論 (Ensemble Inference)
@@ -106,7 +106,11 @@ if __name__ == "__main__":
     ml_scores = generate_ml_scores(df, model_paths=ensemble_paths)
     
     # 將 ml_scores 餵給原本的 traditional 回測框架
-    ml_port_returns, ml_weights = backtest_momentum_strategy(df, ml_scores, top_n=top_n)
+    ml_port_returns, ml_weights = backtest_momentum_strategy(
+        df, ml_scores, top_n=top_n,
+        min_score=_config.ML_MIN_SCORE, fallback=_config.ML_FALLBACK, cost_bps=_config.COST_BPS
+    )
+    rf_returns = month_end_returns(df)[0][_config.RF_TICKER]
     
     # 對齊所有策略的時間軸 (取交集，確保起跑點一致)
     common_index = ml_port_returns.index.intersection(baseline_returns.index)
@@ -121,17 +125,13 @@ if __name__ == "__main__":
     
     print(f"\n🔍 嚴格檢驗：模型未看過的 Test Set 起始日期為 {test_start_date.strftime('%Y-%m-%d')}")
     
-    # 僅保留 Test Set 起始日之後的回測資料
-    oos_index = common_index[common_index >= test_start_date]
+    # 僅保留「決策日」落在 Test Set 起始日之後的持有月 (持有月索引減一個月 = 決策日)
+    oos_index = common_index[(common_index - pd.offsets.MonthEnd(1)) >= test_start_date]
 
     # 更新回測報酬率變數為純樣本外資料
     ml_port_returns = ml_port_returns.loc[oos_index]
     baseline_returns = baseline_returns.loc[oos_index]
     spy_returns = spy_returns.loc[oos_index]
-
-    if len(oos_index) == 0:
-        print("❌ 錯誤：樣本外期間太短，沒有足夠的月底交易日可以回測！建議增加資料總長度。")
-        exit()
 
     if len(oos_index) == 0:
         print("❌ 錯誤：樣本外期間太短，沒有足夠的月底交易日可以回測！建議增加資料總長度。")
@@ -166,13 +166,13 @@ if __name__ == "__main__":
     # 4. 終極績效比較與視覺化
     # ==========================================
     print("\n" + "="*50)
-    print(f"🤖 AI 策略 vs 傳統基準 vs 大盤 (交易月數: {len(oos_index)})")
+    print(f"🤖 AI 策略 vs 傳統基準 vs 大盤 (交易月數: {len(oos_index)}, 成本 {_config.COST_BPS} bps)")
     print("="*50)
-    ml_cum, ml_dd = calculate_performance_metrics(ml_port_returns, name=f"LSTM AI 策略 (Top {top_n})")
+    ml_cum, ml_dd = calculate_performance_metrics(ml_port_returns, name=f"LSTM AI 策略 (Top {top_n})", rf=rf_returns)
     print("-" * 50)
-    base_cum, base_dd = calculate_performance_metrics(baseline_returns, name=f"傳統基準動能 (Top {top_n})")
+    base_cum, base_dd = calculate_performance_metrics(baseline_returns, name=f"傳統基準動能 (Top {top_n})", rf=rf_returns)
     print("-" * 50)
-    spy_cum, spy_dd = calculate_performance_metrics(spy_returns, name="大盤基準 (SPY)")
+    spy_cum, spy_dd = calculate_performance_metrics(spy_returns, name="大盤基準 (SPY)", rf=rf_returns)
     print("="*50)
     
     # 繪圖
