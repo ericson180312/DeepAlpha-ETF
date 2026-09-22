@@ -32,6 +32,23 @@ SEED_START = 42      # 成員 seed = SEED_START + i
 # 2b. 線性基準 (同一組特徵的 ridge 回歸；LSTM 要證明比它好才有存在理由)
 RIDGE_ALPHAS = [1e0, 1e1, 1e2, 1e3, 1e4, 1e5, 1e6]   # 每個 fold 以 val MSE 選一個 (網格上界要夠大，避免卡在邊緣)
 
+# 2c. Pooled 橫斷面 GBDT (_4c_pooled_gbdt.py)
+#   把資料攤成 (日期, 標的) 的列，模型看不到「我是哪一檔」，只能學通用規則。
+#   超參數在本輪開跑前寫定，不做任何搜尋：淺樹 + 重正則化，對應小樣本情境。
+POOLED_LGB_PARAMS = {
+    'objective': 'huber', 'alpha': 0.05,     # 與 LSTM 的 HUBER_DELTA 同尺度
+    'num_leaves': 7,                          # 深度約 3
+    'min_child_samples': 200,
+    'learning_rate': 0.03,
+    'n_estimators': 500,                      # 上限，實際由 early stopping 決定
+    'feature_fraction': 0.7,
+    'bagging_fraction': 0.7, 'bagging_freq': 1,
+    'lambda_l2': 10.0,
+    'verbose': -1,
+}
+POOLED_EARLY_STOPPING = 50                    # val 連續幾輪未改善即停
+POOLED_RIDGE_ALPHAS = [1e0, 1e1, 1e2, 1e3, 1e4, 1e5, 1e6]   # pooled 線性基準，每 fold 以 val MSE 選
+
 # 3. 交易策略參數
 MOM_WINDOWS = [63, 126, 252]   # 動能分數的回看窗口 (交易日)；是否坐在高原上由 _7_momentum_robustness.py 檢驗
 TOP_N = 5            # 每月選取前 N 強標的
@@ -95,4 +112,42 @@ PRE_REGISTRATION_MOMENTUM = """本輪目的：驗證基準動能的 (63,126,252)
    不能回答「動能的 Sharpe 有多可靠」——後者由上一輪的 SE 與 null 百分位回答。
 禁止：不得輸出「建議改用 X」除非判準 C 觸發；不得改動 LSTM/ridge 任何設定；
    不得改標的池、fold 邊界、成本假設；不得事後放寬門檻；不得以單一 fold 或單一軸下結論。
+"""
+
+
+# 5c. Pooled GBDT 的 pre-registration。由 _8_pooled_diagnostics.py 原文印出並機械化判定。
+PRE_REGISTRATION_POOLED = """本輪目的：檢驗「把問題改成 pooled 橫斷面」是否讓 ML 產生**優於傳統動能**的樣本外排序能力。
+不是找最佳模型，也不是救 LSTM。判準服務於前者；任何導向調參的做法都是本輪的失敗。
+
+背景與本輪要競爭的上限（§5b，開跑前已量定）：
+  現行動能 Sharpe 1.06 的拆解為 0.66（多頭部位）+0.17（標的池）+0.19（動能排序）+0.04（現金濾網）。
+  **「選股」這個成分只值 +0.19 Sharpe = 0.40 × SE，且逐 fold 變號（+0.13/−0.33/+0.44/−0.06/−0.65）。**
+  本輪競爭的就是這 0.19。任何宣稱的改善都必須以 SE 為單位陳述，並與這個上限並列。
+
+表徵（開跑前寫定，不得事後增減）：
+  列 = (日期, 標的)。每列的特徵只有三類，**不含任何標的身分**（無 one-hot、無 embedding）：
+   (a) 該標的自身：Ret、Vol_20d、Mom_20d、Mom_60d、Mom_120d
+   (b) 同一日橫斷面內，(a) 各欄的 z-score
+   (c) 共用總經：Global_SPY_Trend_200、Global_SPY_Vol_20d
+  目標與 LSTM 完全相同（未來 20 日相對 SPY 的超額報酬），不做橫斷面去均值，以保可比。
+  Fold、purge、標準化範圍、決策日、回測會計一律沿用既有設定。
+
+模型：LightGBM，超參數固定於 POOLED_LGB_PARAMS，early stopping 於同一個 val 尾段。
+  **本輪不搜尋任何超參數。** 數值是依小樣本情境事前選定（淺樹、重正則化），非調出來的。
+
+判準 A (預測力)：OOS 逐月 rank-IC 均值 > 0 且 t > 2
+   → 成立：「pooled GBDT 有樣本外排序能力」；不成立：「無證據」。
+判準 B (相對 pooled 線性)：GBDT 與同表徵 pooled ridge 的逐月 IC 差，配對 t > 2
+   → 不成立則「非線性不具存在理由」（舉證責任在複雜度一方）。
+判準 C (相對傳統動能，本輪真正的門檻)：GBDT 與動能的逐月 IC 差，配對 t > 2
+   → 不成立則「ML 沒有勝過一條三行的規則」。動能才是對手，不是已被否決的 LSTM。
+判準 D (策略層)：淨成本、扣 rf 的 OOS Sharpe，(GBDT − 動能) ≥ 1 × SE(GBDT)
+   且 GBDT 的 Sharpe 在隨機選股 null 的百分位 ≥ 95%。
+判準 E (一致性)：逐 fold 與匯總並列；符號不一致的 fold 不得省略。
+判準 F (材料性，即使 A~D 全過也適用)：改善量 < 0.5 × SE 一律報成「無實質改善」，
+   並與上面 +0.19（0.40 SE）的上限並列。過門檻一絲一毫不算達成目標。
+
+禁止：不得搜尋超參數；不得在看到結果後增減特徵或改表徵；不得改標的池、fold 邊界、成本假設、目標定義；
+   不得事後放寬門檻；不得以單一 fold 下結論；
+   **若判準不成立，不得以「換一組超參數再試一次」回應**——那正是本專案已列入「不要再試」的行為。
 """
