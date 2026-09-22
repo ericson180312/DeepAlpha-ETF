@@ -16,9 +16,16 @@ rank-IC of +0.11 (t = 2.1) and a Sharpe at the 98th percentile of the same null.
 Four pre-registered rounds have now been run, each committed and pushed before it was executed:
 **round 1** rejected the ensemble LSTM, **round 2** confirmed the momentum baseline is a plateau rather
 than a lucky parameter, **round 3** rejected a pooled cross-sectional LightGBM built specifically to fix
-the LSTM's structural flaw, and **round 4** retested everything on a point-in-time universe with three
+the LSTM's structural flaw, **round 4** retested everything on a point-in-time universe with three
 times the sample — where momentum's ranking ability finally clears significance (t = 2.9 over 163
-months and five stress episodes) while neither ML model beats it. Details below.
+months and five stress episodes) while neither ML model beats it — and **round 5** narrowed the
+question to US vs international with a benchmark built from the universe, where momentum's advantage
+turns out to be a static tilt rather than timing. Details below.
+
+One thing this repo does **not** show: that momentum beats the market on a risk-adjusted basis. Asked
+directly, that difference is +0.18 Sharpe with a 95% CI of [−0.31, +0.69] and a sign that flips across
+sub-periods. What is established is narrower — momentum ranks better than chance *within* a given
+universe.
 
 ## What the pipeline does
 
@@ -36,6 +43,7 @@ months and five stress episodes) while neither ML model beats it. Details below.
 | 8 | `_8_pooled_diagnostics.py` | Verdict for the pooled round against `_config.PRE_REGISTRATION_POOLED`; the bar is plain momentum |
 | 1b | `_1b_fetch_pit_data.py` | Point-in-time data: keeps pre-inception NaN, derives the eligibility mask |
 | 9 | `_9_pit_diagnostics.py` | Round 4 — the same models retested on ~3x the sample, judged against `_config.PRE_REGISTRATION_PIT` |
+| 10 | `_10_geo_timing.py` | Round 5 — can momentum time US vs international, where the benchmark is built from the universe? |
 
 `main.py` runs them in order (about 6 minutes on a GPU). All parameters live in `_config.py`.
 `pytest tests/` runs 37 tests covering the accounting and the walk-forward split; every expected value
@@ -219,6 +227,61 @@ years and strongly positive in the wide ones, so its aggregate +0.097 is an aver
 not a stable effect.
 
 ![pit](pit_report.png)
+
+### Round 5: a benchmark made of the universe
+
+Round 4 left one thing unsettled. Asked directly whether momentum beats the market on Sharpe, the
+paired test came back **+0.18, 95% CI [−0.31, +0.69], p = 0.49**, with the sign flipping across both
+halves and across crisis years. The reason is structural: the 13-ETF pool and SPY are different
+things, so their difference carries a lot of variance that has nothing to do with selection, and the
+noise SD of that Sharpe difference is 0.255 — about eight times the sample, a century of data, would
+be needed to settle it.
+
+Round 5 removes that problem by construction: **the benchmark is made of the universe.** Universe
+{VTI, international}, benchmark VT. Strategy and benchmark now share almost all their variance, and
+the noise SD of the Sharpe difference collapses from 0.255 to **0.06**. Measured before the round was
+written: perfect monthly foresight is worth +0.74 over VT, so the sample can detect a rule capturing
+20% of the available timing value and cannot detect 10%.
+
+The trap the round is designed around is that **US beat international over every available window**,
+so a momentum rule sits in US most of the time and beats VT on a static tilt alone. The pre-registered
+criterion is therefore a tilt/timing decomposition, not a comparison against VT: with `a_t` the US
+weight and `w̄` its sample mean, the timing return is `(a_t − w̄)(R_us − R_intl)`. The active weight
+averages exactly zero, so the average tilt contributes nothing and what is left is pure timing.
+
+VTI + VEU, 218 months (2008-07 to 2026-08), net of 10 bps, Sharpe ex-BIL:
+
+| | CAGR | Max DD | Sharpe ± SE |
+| :--- | :--- | :--- | :--- |
+| VTI buy & hold | 12.25% | −42.3% | **0.72 ± 0.24** |
+| Momentum (all-in) | 11.13% | −43.7% | 0.65 ± 0.24 |
+| Static tilt w = 0.77 | 10.74% | −44.0% | 0.64 ± 0.24 |
+| VT | 8.95% | −46.0% | 0.53 ± 0.24 |
+| VEU buy & hold | 5.69% | −50.6% | 0.33 ± 0.24 |
+
+| Criterion | Rule | Result |
+| :--- | :--- | :--- |
+| A — timing skill | timing return t > 2 | **Fails** (+0.66%/yr, t 0.70) |
+| B — vs exposure-matched tilt | paired 95% CI excludes 0 | **Fails** (Δ **+0.01**, CI [−0.11, +0.11], p 0.93) |
+| C — vs VT (reported only) | not a pass condition | Δ +0.12, CI [−0.01, +0.24], p 0.077 |
+| D — hit rate | binomial vs 50% | **Fails** (54.6%, p 0.198) |
+| E — sign stability | halves and crisis years | consistent |
+| F — two tracks agree | VEU and VXUS same sign | consistent (VXUS: Δ −0.02, timing t 0.36) |
+| G — power clause | effect ≥ 20% of the foresight ceiling | **+1% of ceiling → under-powered** |
+
+The decomposition did exactly what it was built to do. Momentum held US in 77% of months and switched
+sides 22 times in 218. **Against its own average tilt it is worth +0.01 Sharpe — indistinguishable
+from zero.** Its entire +0.12 over VT is that static tilt, and simply holding VTI beat the rotation
+outright in both tracks (0.72 vs 0.65; 0.91 vs 0.83 on the VXUS track). In the top-left panel below
+the momentum and static-tilt curves sit on top of each other, well above VT: that gap is the tilt,
+not the timing.
+
+Criterion G was written in advance precisely for this outcome and it fires: at 1% of the foresight
+ceiling the effect is far below what 218 months can resolve, so the honest verdict is **"under-powered,
+cannot answer"**, not "momentum has no geographic timing skill". The two are different claims and the
+pre-registration forbids substituting one for the other.
+
+![geo timing](geo_timing_report.png)
 
 ### What this means
 

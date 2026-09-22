@@ -18,7 +18,8 @@ def run_pipeline():
         "_4c_pooled_gbdt.py",         # pooled 橫斷面表徵 + LightGBM / pooled ridge
         "_8_pooled_diagnostics.py",   # pooled 模型的判定（對手是動能，不是 LSTM）
         "_1b_fetch_pit_data.py",      # PIT 標的池的資料（保留上市前的 NaN）
-        "_9_pit_diagnostics.py"       # 第四輪：約三倍樣本上的重測
+        "_9_pit_diagnostics.py",      # 第四輪：約三倍樣本上的重測
+        "_10_geo_timing.py"           # 第五輪：地域擇時（基準由標的池本身組成）
     ]
 
     print("🚀 開始執行量化交易全自動化管線 (Auto-Trading Pipeline)...")
@@ -55,7 +56,7 @@ def run_pipeline():
     total_elapsed_time = time.time() - total_start_time
     print("\n" + "=" * 60)
     print(f"🎉 專案全線執行完畢！總耗時: {total_elapsed_time / 60:.2f} 分鐘")
-    print("📊 請檢查資料夾內生成的圖表 (baseline_vs_spy_performance.png, ml_vs_baseline_performance.png, diagnostics_report.png, momentum_robustness.png, pooled_report.png, pit_report.png) 與 模型權重檔 (saved_models/<fold>/*.pth)。")
+    print("📊 請檢查資料夾內生成的圖表 (baseline_vs_spy_performance.png, ml_vs_baseline_performance.png, diagnostics_report.png, momentum_robustness.png, pooled_report.png, pit_report.png, geo_timing_report.png) 與 模型權重檔 (saved_models/<fold>/*.pth)。")
     print("=" * 60)
 
 if __name__ == "__main__":
