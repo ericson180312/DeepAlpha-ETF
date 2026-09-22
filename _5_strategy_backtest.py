@@ -1,204 +1,194 @@
 """
-策略回測模組：將訓練好的 LSTM 模型應用於歷史資料，生成 AI 預測分數，並與傳統基準策略進行績效比較。
-- AI 預測分數生成：使用訓練好的 LSTM 模型對每個月底的資料進行推論，生成一個分數矩陣，代表每個 ETF 在下個月的預期表現。
-- 回測邏輯：將 AI 預測分數餵給原本的傳統動能回測框架，選取分數最高的前 N 強 ETF，計算投資組合的月報酬率。
-- 嚴格樣本外測試：將資料切分為訓練集、驗證集和樣本外測試集，確保模型在未見過的資料上進行回測，避免未來函數 (Look-Ahead Bias)。
-- 績效比較：計算年化報酬率、最大回撤、夏普值，並繪製資金曲線與回撤曲線對比圖表，展示 AI 策略相對於傳統基準和大盤的優劣。
+策略回測模組 (walk-forward)：用每個 fold 自己的 ensemble 對該 fold 的 test 期推論，把各 fold 的樣本外分數
+接起來，餵給 _2 的回測框架，與 ridge 線性基準、傳統動能、SPY 比較。
+- 樣本外的定義：每個月底決策日的分數，都來自「只看過該日之前資料」的模型；第一個 fold 的 test 起點之後全部是 OOS。
+- 四條線用同一套會計 (現金月計 0%、扣成本、扣 rf 的 Sharpe)，見 _2_baseline_performance.py。
+- 逐 fold (逐年) 的結果與匯總並列，不以單一 fold 下結論。
 """
+
+import os
+from collections import defaultdict
 
 import pandas as pd
 import numpy as np
 import torch
-import _config
 import matplotlib.pyplot as plt
-from _3_ml_data_pipeline import generate_ml_features  # 引入寫好的特徵工程
-from _4_lstm_model import MomentumLSTM                 # 引入模型架構
-from _2_baseline_performance import backtest_momentum_strategy, calculate_performance_metrics, month_end_returns
+
+import _config
+from _2_baseline_performance import (calculate_momentum_features, backtest_momentum_strategy,
+                                     performance_metrics, month_end_returns)
+from _3_ml_data_pipeline import generate_ml_features, fold_specs, make_fold, month_end_positions
+from _4_lstm_model import MomentumLSTM, model_paths
+from _4b_ridge_baseline import ridge_scores
+
+PALETTE = {'lstm': '#2a78d6', 'ridge': '#eb6834', 'mom': '#1baf7a', 'spy': '#52514e'}
+
 
 # ==========================================
-# 1. 執行 LSTM 集成模型推論 (Ensemble Inference)
+# 1. Ensemble 推論
 # ==========================================
-def generate_ml_scores(df, model_paths, seq_length=60):
-    print(f"🧠 啟動 AI 投資委員會進行回測 (共 {len(model_paths)} 個模型)...")
-    
-    X, _ = generate_ml_features(df)
-    
-    # 標準化參數
-    train_end = int(len(X) * 0.6) # 依照你的 60% 訓練集比例
-    train_mean = X.iloc[:train_end].mean()
-    train_std = X.iloc[:train_end].std() + 1e-8
-    X_scaled = (X - train_mean) / train_std
-    
-    device = torch.device('cuda' if torch.cuda.is_available() else 'mps' if torch.backends.mps.is_available() else 'cpu')
-    input_size = X.shape[1]
-    output_size = len([c for c in df.columns if c != 'SPY'])
-    
-    # 🌟 載入所有的模型到清單中
+def usable_folds(X, Y):
+    """展開設定檔的 fold，略過 train 樣本不足者。回傳 [(name, fold_dict), ...]。"""
+    folds = [(name, make_fold(X, Y, ts, te)) for name, ts, te in fold_specs(X)]
+    return [(n, f) for n, f in folds if len(f['train_pos']) >= _config.WF_MIN_TRAIN_SAMPLES]
+
+
+def load_fold_models(fold_name, input_size, output_size, device):
     models = []
-    for path in model_paths:
-        model = MomentumLSTM(input_size=input_size, hidden_size=_config.HIDDEN_SIZE, output_size=output_size, num_layers=1)
-        try:
-            model.load_state_dict(torch.load(path, map_location=device))
-            model.to(device)
-            model.eval()
-            models.append(model)
-        except FileNotFoundError:
-            print(f"❌ 找不到模型權重檔: {path}，請先執行訓練！")
-            exit()
-            
-    print(f"✅ 成功載入 {len(models)} 個 LSTM 模型權重！")
-    
-    # 找出每個月最後一個實際交易日
-    monthly_dates = df.groupby(df.index.strftime('%Y-%m')).tail(1).index
-    ml_scores = pd.DataFrame(index=monthly_dates, columns=[c for c in df.columns if c != 'SPY'])
-    
+    for path in model_paths(fold_name):
+        if not os.path.exists(path):
+            raise FileNotFoundError(f"找不到模型權重檔 {path}，請先執行 _4_lstm_model.py 訓練。")
+        model = MomentumLSTM(input_size, _config.HIDDEN_SIZE, output_size)
+        model.load_state_dict(torch.load(path, map_location=device))
+        model.to(device).eval()
+        models.append(model)
+    return models
+
+
+def score_positions(models, X_scaled, positions, seq_length=_config.SEQ_LENGTH, device='cpu'):
+    """對一組視窗結束位置推論，回傳 (n_models, n_positions, n_assets)。"""
+    windows = np.stack([X_scaled.values[p - seq_length + 1: p + 1] for p in positions])
+    tensor_in = torch.tensor(windows, dtype=torch.float32).to(device)
     with torch.no_grad():
-        for date in monthly_dates:
-            if date in X_scaled.index:
-                idx = X_scaled.index.get_loc(date)
-                if idx >= seq_length - 1:
-                    window = X_scaled.iloc[idx - seq_length + 1 : idx + 1]
-                    tensor_in = torch.tensor(window.values, dtype=torch.float32).unsqueeze(0).to(device)
-                    
-                    # 🌟 讓 20 個模型各自預測，然後平均
-                    ensemble_preds = []
-                    for model in models:
-                        pred = model(tensor_in).cpu().numpy()[0]
-                        ensemble_preds.append(pred)
-                        
-                    # 取平均分數 (axis=0 代表對各個標的的分數分別取平均)
-                    avg_pred = np.mean(ensemble_preds, axis=0)
-                    
-                    ml_scores.loc[date] = avg_pred
-                    
-    ml_scores = ml_scores.dropna(how='all').astype(float)
-    print("✅ AI 委員會評分完畢！")
-    return ml_scores
+        return np.stack([m(tensor_in).cpu().numpy() for m in models])
+
+
+def generate_ml_scores(X, Y, folds, assets, where='test'):
+    """
+    每個 fold 用自己的 ensemble 對 where 段 ('test' = 樣本外, 'train' = 樣本內診斷用) 的月底決策日推論。
+    回傳 (ensemble 平均分數 [決策日 x 標的], {成員序號: 該成員分數})。
+    """
+    device = torch.device('cuda' if torch.cuda.is_available() else 'mps' if torch.backends.mps.is_available() else 'cpu')
+    ens_pieces, member_pieces = [], defaultdict(list)
+    for name, fold in folds:
+        pos = month_end_positions(X, fold[f'{where}_pos'])
+        if len(pos) == 0:
+            continue
+        models = load_fold_models(name, X.shape[1], len(assets), device)
+        preds = score_positions(models, fold['X_scaled'], pos, device=device)
+        idx = X.index[pos]
+        ens_pieces.append(pd.DataFrame(preds.mean(axis=0), index=idx, columns=assets))
+        for i in range(preds.shape[0]):
+            member_pieces[i].append(pd.DataFrame(preds[i], index=idx, columns=assets))
+    ensemble = pd.concat(ens_pieces).sort_index()
+    members = {i: pd.concat(v).sort_index() for i, v in member_pieces.items()}
+    return ensemble, members
+
+
+# ==========================================
+# 2. 逐 fold 績效
+# ==========================================
+def fold_of_holding_month(dates, folds):
+    """持有月 -> 所屬 fold 名稱 (依決策日 = 前一個月底)。"""
+    decision = pd.DatetimeIndex(dates) - pd.offsets.MonthEnd(1)
+    out = pd.Series(None, index=dates, dtype=object)
+    for name, fold in folds:
+        mask = (decision >= fold['test_start']) & (decision < fold['test_end'])
+        out[mask] = name
+    return out
+
+
+def per_fold_table(series_dict, fold_labels, rf, metric):
+    """列 = fold，欄 = 策略，值 = 指定指標。"""
+    rows = {}
+    for name in fold_labels.dropna().unique():
+        idx = fold_labels.index[fold_labels == name]
+        rows[name] = {s: performance_metrics(r.reindex(idx).dropna(), rf)[metric] for s, r in series_dict.items()}
+    return pd.DataFrame(rows).T
+
 
 if __name__ == "__main__":
-    # ==========================================
-    # 2. 讀取資料與基準策略績效
-    # ==========================================
     df = pd.read_csv("etf_adj_close_clean.csv", index_col="Date", parse_dates=True)
-    
-    if 'SPY' not in df.columns:
-        print("❌ 資料中找不到 'SPY'，請確認資料管線。")
-        exit()
+    for col in ('SPY', _config.RF_TICKER):
+        if col not in df.columns:
+            print(f"❌ 資料中找不到 '{col}'，請確認資料管線。")
+            exit()
 
-    # 讀取上一階段存下來的 Baseline 與 SPY 報酬率
-    try:
-        baseline_df = pd.read_csv("baseline_monthly_returns.csv", index_col="Date", parse_dates=True)
-        baseline_returns = baseline_df['Strategy_Return']
-        spy_returns = baseline_df['SPY_Return']
-    except FileNotFoundError:
-        print("❌ 找不到 baseline_monthly_returns.csv，請先執行基準策略回測。")
-        exit()
+    X, Y = generate_ml_features(df)
+    assets = [c.replace('_Target', '') for c in Y.columns]
+    folds = usable_folds(X, Y)
+    top_n = _config.TOP_N
 
-    # ==========================================
-    # 3. 執行 AI 策略回測
-    # ==========================================
-    top_n = _config.TOP_N # 一樣選取前 5 強
-    
-    # 定義要載入的 Ensemble 模型清單
-    ensemble_paths = [f'saved_models/ensemble_lstm_seed_{seed}.pth' for seed in range(42, 62)]
-    
-    # 取得 AI 委員會的平均預測分數
-    ml_scores = generate_ml_scores(df, model_paths=ensemble_paths)
-    
-    # 將 ml_scores 餵給原本的 traditional 回測框架
-    ml_port_returns, ml_weights = backtest_momentum_strategy(
-        df, ml_scores, top_n=top_n,
-        min_score=_config.ML_MIN_SCORE, fallback=_config.ML_FALLBACK, cost_bps=_config.COST_BPS
-    )
-    rf_returns = month_end_returns(df)[0][_config.RF_TICKER]
-    
-    # 對齊所有策略的時間軸 (取交集，確保起跑點一致)
-    common_index = ml_port_returns.index.intersection(baseline_returns.index)
+    # --- 三種分數 ---
+    print(f"\n🧠 Walk-forward 推論：{len(folds)} 個 fold × {_config.N_MODELS} 個成員")
+    ml_scores, _ = generate_ml_scores(X, Y, folds, assets)
+    ridge_sc, ridge_info = ridge_scores(X, Y, folds, assets)
+    mom_scores = calculate_momentum_features(df)
+    print(f"✅ LSTM 分數 {len(ml_scores)} 個決策日 ({ml_scores.index[0].date()} ~ {ml_scores.index[-1].date()})")
 
-    # 🚨🚨🚨 新增：嚴格切分「樣本外測試期 (Out-of-Sample)」 🚨🚨🚨
-    # 調整測試集比例：前 60% 訓練，20% 驗證，最後 20% 留給 OOS 測試
-    X, _ = generate_ml_features(df)
-    # 計算 Train + Val 的比例總和，也就是 Test Set 的起點
-    train_val_ratio = _config.TRAIN_RATIO + _config.VAL_RATIO 
-    test_start_idx = int(len(X) * train_val_ratio) 
-    test_start_date = X.index[test_start_idx]
-    
-    print(f"\n🔍 嚴格檢驗：模型未看過的 Test Set 起始日期為 {test_start_date.strftime('%Y-%m-%d')}")
-    
-    # 僅保留「決策日」落在 Test Set 起始日之後的持有月 (持有月索引減一個月 = 決策日)
-    oos_index = common_index[(common_index - pd.offsets.MonthEnd(1)) >= test_start_date]
+    # --- 回測 (同一套會計) ---
+    ml_ret, ml_w = backtest_momentum_strategy(df, ml_scores, top_n, _config.ML_MIN_SCORE, _config.ML_FALLBACK, _config.COST_BPS)
+    ridge_ret, _ = backtest_momentum_strategy(df, ridge_sc, top_n, _config.ML_MIN_SCORE, _config.ML_FALLBACK, _config.COST_BPS)
+    base_ret, _ = backtest_momentum_strategy(df, mom_scores, top_n, _config.BASE_MIN_SCORE, _config.BASE_FALLBACK, _config.COST_BPS)
+    monthly_returns, last_month_complete = month_end_returns(df)
+    if not last_month_complete:
+        print(f"⚠️ 最後一個月不完整 (資料止於 {df.index[-1].date()})，該月不納入回測。")
+    rf = monthly_returns[_config.RF_TICKER]
 
-    # 更新回測報酬率變數為純樣本外資料
-    ml_port_returns = ml_port_returns.loc[oos_index]
-    baseline_returns = baseline_returns.loc[oos_index]
-    spy_returns = spy_returns.loc[oos_index]
-
+    oos_start = folds[0][1]['test_start']
+    oos_index = ml_ret.index[(ml_ret.index - pd.offsets.MonthEnd(1)) >= oos_start]
+    oos_index = oos_index.intersection(ridge_ret.index).intersection(base_ret.index)
     if len(oos_index) == 0:
-        print("❌ 錯誤：樣本外期間太短，沒有足夠的月底交易日可以回測！建議增加資料總長度。")
+        print("❌ 沒有任何樣本外持有月，請檢查 fold 設定與資料長度。")
         exit()
-        
-    # ==========================================
-    # 📈 額外功能：印出樣本外 (OOS) 每個月的 AI 選股名單
-    # ==========================================
-    print("\n" + "🌟"*25)
-    print(f"🤖 AI 策略各月份 Top {top_n} 標的與評分 (樣本外期間)")
-    print("🌟"*25)
-    
-# 🌟 關鍵修正：將分數矩陣也對齊到「日曆月底」，解決週末日期對不上的問題
-    ml_scores_aligned = ml_scores.resample('ME').last()
-    
-    for date in oos_index:
-        # 改從對齊後的矩陣尋找
-        if date in ml_scores_aligned.index:
-            valid_scores = ml_scores_aligned.loc[date].dropna()
-            
-            # 使用 nlargest 抓出分數最高的 Top N 檔
-            top_tickers = valid_scores.nlargest(top_n)
-            
-            print(f"📅 換股日: {date.strftime('%Y-%m-%d')}")
-            for rank, (ticker, score) in enumerate(top_tickers.items(), 1):
-                # {ticker:<5} 代表向左對齊並保留 5 個字元寬度，讓排版更整齊
-                # {score:+.4f} 代表強制顯示正負號，並取到小數點後 4 位
-                print(f"   第 {rank} 名: {ticker:<5} | 預期 Alpha 分數: {score:+.4f}")
-            print("-" * 40)
-    
-    # ==========================================
-    # 4. 終極績效比較與視覺化
-    # ==========================================
-    print("\n" + "="*50)
-    print(f"🤖 AI 策略 vs 傳統基準 vs 大盤 (交易月數: {len(oos_index)}, 成本 {_config.COST_BPS} bps)")
-    print("="*50)
-    ml_cum, ml_dd = calculate_performance_metrics(ml_port_returns, name=f"LSTM AI 策略 (Top {top_n})", rf=rf_returns)
-    print("-" * 50)
-    base_cum, base_dd = calculate_performance_metrics(baseline_returns, name=f"傳統基準動能 (Top {top_n})", rf=rf_returns)
-    print("-" * 50)
-    spy_cum, spy_dd = calculate_performance_metrics(spy_returns, name="大盤基準 (SPY)", rf=rf_returns)
-    print("="*50)
-    
-    # 繪圖
-    plt.figure(figsize=(16, 10))
-    
-    # 資金曲線
-    plt.subplot(2, 1, 1)
-    plt.plot(ml_cum.index, ml_cum.values, label='LSTM AI Strategy', color='purple', linewidth=2.5)
-    plt.plot(base_cum.index, base_cum.values, label='Baseline Momentum', color='blue', linewidth=1.5, alpha=0.7)
-    plt.plot(spy_cum.index, spy_cum.values, label='SPY (Benchmark)', color='gray', linestyle='--', linewidth=1.5)
-    plt.title('Ultimate Showdown: AI Strategy vs Baseline vs SPY')
-    plt.ylabel('Cumulative Return')
-    plt.legend()
-    plt.grid(True, alpha=0.3)
-    
-    # 回撤曲線
-    plt.subplot(2, 1, 2)
-    plt.fill_between(ml_dd.index, ml_dd.values, 0, color='purple', alpha=0.2, label='AI Drawdown')
-    plt.plot(base_dd.index, base_dd.values, color='blue', linewidth=1, alpha=0.5, label='Baseline Drawdown')
-    plt.plot(spy_dd.index, spy_dd.values, color='gray', linestyle='--', linewidth=1, label='SPY Drawdown')
-    plt.title('Drawdown Comparison')
-    plt.ylabel('Drawdown')
-    plt.legend()
-    plt.grid(True, alpha=0.3)
-    
+
+    series = {
+        'LSTM ensemble': ml_ret.reindex(oos_index),
+        'Ridge (linear)': ridge_ret.reindex(oos_index),
+        'Momentum': base_ret.reindex(oos_index),
+        'SPY': monthly_returns['SPY'].reindex(oos_index),
+    }
+
+    # --- 各月 AI 選股 (一行一個月) ---
+    print("\n" + "🌟" * 25)
+    print(f"🤖 LSTM 各月份 Top {top_n} 標的 (樣本外，決策日 -> 持有下月)")
+    print("🌟" * 25)
+    for date, row in ml_scores.iterrows():
+        top = row.nlargest(top_n)
+        held = [f"{k}({v:+.3f})" for k, v in top.items()]
+        n_pos = int((top > _config.ML_MIN_SCORE).sum())
+        tail = "" if n_pos == top_n else f"  ← {top_n - n_pos} 槽改持 {_config.ML_FALLBACK}"
+        print(f"  {date.strftime('%Y-%m-%d')}: " + ", ".join(held) + tail)
+
+    # --- 匯總績效 ---
+    print("\n" + "=" * 60)
+    print(f"🤖 樣本外匯總 ({len(oos_index)} 個月, {oos_index[0].strftime('%Y-%m')} ~ {oos_index[-1].strftime('%Y-%m')}, "
+          f"成本 {_config.COST_BPS} bps, Sharpe 扣 {_config.RF_TICKER})")
+    print("=" * 60)
+    summary = pd.DataFrame({name: performance_metrics(r, rf) for name, r in series.items()}).T
+    print(summary.to_string(formatters={'CAGR': '{:.2%}'.format, 'MDD': '{:.2%}'.format, 'n': '{:.0f}'.format},
+                            float_format=lambda v: f"{v:.2f}"))
+
+    # --- 逐 fold ---
+    fold_labels = fold_of_holding_month(oos_index, folds)
+    print("\n📆 逐 fold Sharpe (扣 rf)：")
+    print(per_fold_table(series, fold_labels, rf, 'Sharpe').to_string(float_format=lambda v: f"{v:6.2f}"))
+    print("\n📆 逐 fold CAGR：")
+    print(per_fold_table(series, fold_labels, rf, 'CAGR').to_string(float_format=lambda v: f"{v:7.1%}"))
+    print("\n📐 Ridge 每個 fold 選到的 alpha 與 val MSE (zero_pred = 永遠預測 0)：")
+    print(ridge_info[['alpha', 'val_mse', 'zero_pred_val_mse']].to_string(float_format=lambda v: f"{v:.6f}"))
+
+    # --- 繪圖 ---
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(16, 10), facecolor='#fcfcfb')
+    styles = {'LSTM ensemble': (PALETTE['lstm'], '-', 2.5), 'Ridge (linear)': (PALETTE['ridge'], '-', 1.8),
+              'Momentum': (PALETTE['mom'], '-', 1.8), 'SPY': (PALETTE['spy'], '--', 1.5)}
+    for name, r in series.items():
+        color, ls, lw = styles[name]
+        cum = (1 + r).cumprod()
+        dd = cum / cum.cummax() - 1
+        ax1.plot(cum.index, cum.values, label=name, color=color, linestyle=ls, linewidth=lw)
+        ax2.plot(dd.index, dd.values, label=name, color=color, linestyle=ls, linewidth=lw)
+    ax1.set_title(f'Walk-forward out-of-sample equity ({oos_index[0].year}-{oos_index[-1].year}, net of {_config.COST_BPS} bps)', loc='left')
+    ax1.set_ylabel('Cumulative Return'); ax1.legend(frameon=False); ax1.grid(True, alpha=0.3)
+    ax2.set_title('Drawdown', loc='left'); ax2.set_ylabel('Drawdown'); ax2.legend(frameon=False); ax2.grid(True, alpha=0.3)
+    for ax in (ax1, ax2):
+        ax.set_facecolor('#fcfcfb')
+        for s in ('top', 'right'):
+            ax.spines[s].set_visible(False)
     plt.tight_layout()
     output_image = "ml_vs_baseline_performance.png"
-    plt.savefig(output_image)
-    print(f"\n📈 終極比較圖表已儲存至: {output_image}")
+    plt.savefig(output_image, dpi=110)
+    print(f"\n📈 比較圖表已儲存至: {output_image}")
+
+    pd.DataFrame(series).to_csv("oos_monthly_returns.csv")
+    print("💾 樣本外月報酬已儲存至: oos_monthly_returns.csv")

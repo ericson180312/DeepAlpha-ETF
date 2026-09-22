@@ -216,3 +216,9 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# 專案：模型權重由 _4_lstm_model.py 重新產生，不進版控 (每次重訓都會變，且體積大)
+saved_models/
+
+# 編輯器
+.vscode/

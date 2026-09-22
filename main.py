@@ -5,14 +5,15 @@ import os
 
 def run_pipeline():
     # 定義要依序執行的腳本清單
-    # 這裡確保按照資料抓取 -> 基準回測 -> 特徵管線(測試) -> 模型訓練 -> AI回測 的順序
+    # 資料抓取 -> 基準回測 -> 特徵/fold 檢查 -> walk-forward 訓練 -> 線性基準 -> 樣本外回測 -> 診斷與判定
     scripts = [
         "_1_fetch_and_clean_data.py",
         "_2_baseline_performance.py",
-        "_3_ml_data_pipeline.py",     # 測試特徵工程是否正常運作
-        "_4_lstm_model.py",           # 執行 Ensemble Learning 模型訓練
-        "_5_strategy_backtest.py",    # 進行終極回測與繪圖
-        "_6_diagnostics.py"           # 預測力 (IC)、統計不確定性、null 比較
+        "_3_ml_data_pipeline.py",     # 列出 walk-forward folds 並測試特徵工程
+        "_4_lstm_model.py",           # 每個 fold 訓練一組 Ensemble LSTM
+        "_4b_ridge_baseline.py",      # 同特徵的 ridge 線性基準
+        "_5_strategy_backtest.py",    # 樣本外回測與繪圖 (LSTM / ridge / 動能 / SPY)
+        "_6_diagnostics.py"           # 預測力 (IC)、統計不確定性、null 比較、依 pre-registration 判定
     ]
 
     print("🚀 開始執行量化交易全自動化管線 (Auto-Trading Pipeline)...")
@@ -49,7 +50,7 @@ def run_pipeline():
     total_elapsed_time = time.time() - total_start_time
     print("\n" + "=" * 60)
     print(f"🎉 專案全線執行完畢！總耗時: {total_elapsed_time / 60:.2f} 分鐘")
-    print("📊 請檢查資料夾內生成的圖表 (baseline_vs_spy_performance.png, ml_vs_baseline_performance.png, diagnostics_report.png) 與 模型權重檔 (*.pth)。")
+    print("📊 請檢查資料夾內生成的圖表 (baseline_vs_spy_performance.png, ml_vs_baseline_performance.png, diagnostics_report.png) 與 模型權重檔 (saved_models/<fold>/*.pth)。")
     print("=" * 60)
 
 if __name__ == "__main__":

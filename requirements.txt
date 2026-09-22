@@ -1,0 +1,8 @@
+# 在 ML_env (Python 3.13) 實測可用的版本；其他版本不保證數值完全一致 (尤其 torch / yfinance)
+yfinance==1.4.1
+pandas==3.0.3
+numpy==2.4.6
+torch==2.11.0
+scikit-learn==1.9.0
+scipy==1.17.1
+matplotlib==3.10.9

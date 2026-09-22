@@ -1,5 +1,13 @@
 """
-機器學習資料管線模組：從原始歷史價格資料中生成特徵矩陣 (X) 和目標矩陣 (Y)，並建立 PyTorch 的 Dataset 和 DataLoader 以供模型訓練使用。
+機器學習資料管線模組：從歷史價格生成特徵矩陣 (X) 與目標矩陣 (Y)，定義 walk-forward 的 fold，
+並建立 PyTorch 的 Dataset / DataLoader。
+
+- 特徵與 target 分開處理：X 保留所有特徵齊全的日子，Y 在尾端 TARGET_HORIZON 天為 NaN (尚未實現)。
+  這樣推論時可以用到最新一天的特徵，而不是因為 target 缺值把最近 20 天一起丟掉。
+- 樣本以「視窗結束日」定義：第 t 天的樣本 = X[t-SEQ+1 : t+1] 與 Y[t]。視窗可以往前跨到別的 segment
+  (特徵是回顧性的，不構成洩漏)；洩漏只會經由 target，所以 segment 交界處 purge TARGET_HORIZON 個樣本。
+- Walk-forward：每個 fold 用 test 起點之前的資料訓練，val 為 train 尾端固定月數，供 early stopping。
+- 標準化只用 val 起點之前的特徵統計量。
 """
 
 import pandas as pd
@@ -11,159 +19,152 @@ from torch.utils.data import Dataset, DataLoader
 # ==========================================
 # 1. 特徵工程模組 (Feature Engineering)
 # ==========================================
-def generate_ml_features(df):
+def generate_ml_features(df, horizon=_config.TARGET_HORIZON):
     """
-    V2 優化版：加入大盤總經特徵，並將預測目標改為「超額報酬 (Alpha)」
+    回傳 (X, Y)，索引相同。X 為所有特徵齊全的日子；Y 對齊 X，尾端尚未實現的 target 為 NaN。
     """
-    print("⚙️ 開始進行優化版特徵工程 (加入總經趨勢與 Alpha 目標)...")
-    
+    print("⚙️ 開始進行特徵工程 (總經趨勢 + 個體動能, target = 相對 SPY 的超額報酬)...")
+
     data = df.copy()
     features = pd.DataFrame(index=data.index)
-    
-    # ==========================================
-    # 🌟 新增：全域總經特徵 (Global Macro Features)
-    # ==========================================
-    # 1. 計算大盤 (SPY) 的 200 日移動平均線 (牛熊分界線)
+
+    # --- 全域總經特徵 (Global Macro Features) ---
     spy_200ma = data['SPY'].rolling(window=200).mean()
-    
-    # 2. 大盤乖離率：(現在價格 - 200MA) / 200MA。大於 0 代表多頭，小於 0 代表空頭
-    features['Global_SPY_Trend_200'] = (data['SPY'] - spy_200ma) / spy_200ma
-    
-    # 3. 大盤短期波動率：當大盤開始劇烈震盪，通常是反轉或大跌的前兆
-    features['Global_SPY_Vol_20d'] = data['SPY'].pct_change().rolling(20).std()
-    
-    # ==========================================
-    # 既有：各資產個體特徵 (Local Features)
-    # ==========================================
+    features['Global_SPY_Trend_200'] = (data['SPY'] - spy_200ma) / spy_200ma       # 大盤乖離率
+    features['Global_SPY_Vol_20d'] = data['SPY'].pct_change().rolling(20).std()     # 大盤短期波動率
+
+    # --- 各資產個體特徵 (Local Features) ---
     for col in data.columns:
-        if col == 'SPY': 
-            continue # 大盤已經作為全域特徵，不再納入個體比較
-            
+        if col == 'SPY':
+            continue
         features[f'{col}_Ret'] = data[col].pct_change()
         features[f'{col}_Vol_20d'] = data[col].pct_change().rolling(20).std()
         features[f'{col}_Mom_20d'] = data[col].pct_change(20)
         features[f'{col}_Mom_60d'] = data[col].pct_change(60)
-
         features[f'{col}_Mom_120d'] = data[col].pct_change(120)
-        # features[f'{col}_Mom_240d'] = data[col].pct_change(240)
-        
-    # ==========================================
-    # 🌟 關鍵修改：預測目標 (Target) 改為「超額報酬 (Excess Return)」
-    # ==========================================
+
+    # --- 預測目標：未來 horizon 天的超額報酬 (Alpha) ---
     targets = pd.DataFrame(index=data.index)
-    
-    # 計算大盤未來 20 天的真實報酬
-    spy_future_ret = data['SPY'].pct_change(20).shift(-20)
-    
+    spy_future_ret = data['SPY'].pct_change(horizon).shift(-horizon)
     for col in data.columns:
         if col != 'SPY':
-            # 該資產未來 20 天的真實報酬
-            asset_future_ret = data[col].pct_change(20).shift(-20)
-            
-            # 目標 Y = 該資產報酬 - 大盤報酬 (算出 Alpha)
-            # 這樣模型就會被迫去尋找「能跑贏大盤」的資產，而不是「不會虧錢」的資產
+            asset_future_ret = data[col].pct_change(horizon).shift(-horizon)
             targets[f'{col}_Target'] = asset_future_ret - spy_future_ret
-            
-    # 清除 NaN
-    combined = pd.concat([features, targets], axis=1).dropna()
-    
-    X = combined[features.columns]
-    Y = combined[targets.columns]
-    
-    print(f"✅ 特徵工程 V2 完成！特徵矩陣大小: {X.shape}, 目標矩陣大小: {Y.shape}")
+
+    X = features.dropna()
+    Y = targets.reindex(X.index)
+
+    print(f"✅ 特徵工程完成！X: {X.shape} ({X.index[0].date()} ~ {X.index[-1].date()}), "
+          f"Y 已實現: {int(Y.notna().all(axis=1).sum())} 筆")
     return X, Y
 
+
 # ==========================================
-# 2. PyTorch 資料集模組 (Custom Dataset)
+# 2. Walk-forward fold 定義
 # ==========================================
-class TimeSeriesDataset(Dataset):
+def fold_specs(X, test_starts=_config.WF_TEST_STARTS):
+    """把設定檔的 test 起點清單展開成 [(name, test_start, test_end), ...]，最後一個 fold 到資料尾端。"""
+    starts = [pd.Timestamp(s) for s in test_starts]
+    ends = starts[1:] + [X.index[-1] + pd.Timedelta(days=1)]
+    return [(f"test_{s.date()}", s, e) for s, e in zip(starts, ends)]
+
+
+def make_fold(X, Y, test_start, test_end,
+              val_months=_config.WF_VAL_MONTHS,
+              horizon=_config.TARGET_HORIZON,
+              seq_length=_config.SEQ_LENGTH):
     """
-    自定義 PyTorch Dataset，處理時間序列的滾動視窗 (Sliding Window)
+    建立一個 fold：回傳 dict，含各 segment 的樣本位置 (X 的整數列索引)、標準化參數與標準化後的 X。
+
+    位置定義 (皆為 X 的列索引)：
+      t0 = 第一個 >= test_start 的列, t1 = 第一個 >= test_end 的列, v0 = 第一個 >= (test_start - val_months) 的列
+      train: [seq_length-1, v0 - horizon)   且 Y 已實現   ← purge 尾端 horizon 個樣本
+      val  : [v0, t0 - horizon)             且 Y 已實現   ← purge 尾端 horizon 個樣本，early stopping 看不到 test 期報酬
+      test : [t0, t1)                        (Y 可為 NaN；推論不需要 Y)
     """
-    def __init__(self, X, Y, seq_length=60):
-        """
-        X: 特徵矩陣 (numpy array)
-        Y: 目標矩陣 (numpy array)
-        seq_length: 模型回溯的天數 (Lookback window)
-        """
-        self.X = torch.tensor(X.values, dtype=torch.float32)
+    idx = X.index
+    t0 = int(idx.searchsorted(test_start))
+    t1 = int(idx.searchsorted(test_end))
+    v0 = int(idx.searchsorted(test_start - pd.DateOffset(months=val_months)))
+    y_ok = Y.notna().all(axis=1).values
+
+    def positions(lo, hi, need_y=True):
+        pos = np.arange(max(lo, seq_length - 1), max(hi, 0))
+        return pos[y_ok[pos]] if need_y else pos
+
+    train_pos = positions(0, v0 - horizon)
+    val_pos = positions(v0, t0 - horizon)
+    test_pos = positions(t0, t1, need_y=False)
+
+    # 標準化：只用 val 起點之前的特徵 (不含任何 target 資訊)
+    mean = X.iloc[:v0].mean()
+    std = X.iloc[:v0].std() + 1e-8
+    X_scaled = (X - mean) / std
+
+    return {'test_start': test_start, 'test_end': test_end,
+            'train_pos': train_pos, 'val_pos': val_pos, 'test_pos': test_pos,
+            'mean': mean, 'std': std, 'X_scaled': X_scaled}
+
+
+def describe_fold(name, fold, X):
+    """一行摘要：各 segment 的樣本數與日期範圍。"""
+    def rng(pos):
+        return f"{len(pos):4d} 筆 {X.index[pos[0]].date()}~{X.index[pos[-1]].date()}" if len(pos) else "   0 筆"
+    return f"{name}: train {rng(fold['train_pos'])} | val {rng(fold['val_pos'])} | test {rng(fold['test_pos'])}"
+
+
+# ==========================================
+# 3. PyTorch 資料集模組 (Custom Dataset)
+# ==========================================
+class WindowDataset(Dataset):
+    """
+    以「視窗結束位置」定義的滾動視窗資料集。
+    第 i 個樣本 = X_scaled[end_i - seq_length + 1 : end_i + 1] 與 Y[end_i]。
+    """
+    def __init__(self, X_scaled, Y, end_positions, seq_length=_config.SEQ_LENGTH):
+        self.X = torch.tensor(X_scaled.values, dtype=torch.float32)
         self.Y = torch.tensor(Y.values, dtype=torch.float32)
+        self.ends = np.asarray(end_positions)
         self.seq_length = seq_length
 
     def __len__(self):
-        # 總共能切出多少個完整的視窗
-        return len(self.X) - self.seq_length
+        return len(self.ends)
 
-    def __getitem__(self, idx):
-        # 取得從 idx 開始，長度為 seq_length 的一段歷史特徵
-        x_window = self.X[idx : idx + self.seq_length]
-        # 取得這段歷史「最後一天」對應的未來預測目標
-        y_target = self.Y[idx + self.seq_length - 1]
-        
-        return x_window, y_target
+    def __getitem__(self, i):
+        end = self.ends[i]
+        return self.X[end - self.seq_length + 1: end + 1], self.Y[end]
 
-# ==========================================
-# 3. 資料切分與標準化模組
-# ==========================================
-def prepare_dataloaders(X, Y, 
-                        seq_length=_config.SEQ_LENGTH, 
-                        batch_size=_config.BATCH_SIZE, 
-                        train_ratio=_config.TRAIN_RATIO, 
-                        val_ratio=_config.VAL_RATIO):
-    """
-    嚴格按時間軸切分 Train/Val/Test，並建立 DataLoader
-    """
-    n_samples = len(X)
-    train_end = int(n_samples * train_ratio)
-    val_end = int(n_samples * (train_ratio + val_ratio))
-    
-    print(f"✂️ 依時間軸切分資料 (Train: {train_ratio*100}%, Val: {val_ratio*100}%, Test: {(1-train_ratio-val_ratio)*100:.1f}%)")
-    
-    # ⚠️ 時間序列絕對不能用 sklearn 的 train_test_split (預設會打亂順序)
-    X_train, Y_train = X.iloc[:train_end], Y.iloc[:train_end]
-    X_val, Y_val = X.iloc[train_end:val_end], Y.iloc[train_end:val_end]
-    X_test, Y_test = X.iloc[val_end:], Y.iloc[val_end:]
-    
-    # --- 特徵標準化 (Z-Score Normalization) ---
-    # 深度學習對數值範圍很敏感，必須標準化
-    # ⚠️ 關鍵：只能用 Train set 的均值與標準差來縮放 Val 和 Test，否則會資料外洩
-    train_mean = X_train.mean()
-    train_std = X_train.std() + 1e-8 # 加上微小值避免除以零
-    
-    X_train_scaled = (X_train - train_mean) / train_std
-    X_val_scaled = (X_val - train_mean) / train_std
-    X_test_scaled = (X_test - train_mean) / train_std
-    
-    # --- 建立 PyTorch Dataset ---
-    train_dataset = TimeSeriesDataset(X_train_scaled, Y_train, seq_length)
-    val_dataset = TimeSeriesDataset(X_val_scaled, Y_val, seq_length)
-    test_dataset = TimeSeriesDataset(X_test_scaled, Y_test, seq_length)
-    
-    # --- 建立 DataLoader ---
-    # train_loader 可以 shuffle，因為每筆資料 (x_window, y_target) 的內部時間順序是固定的
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
-    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
-    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
-    
-    print("📦 PyTorch DataLoaders 準備就緒！")
-    return train_loader, val_loader, test_loader, train_mean, train_std
+
+def fold_dataloaders(X, Y, fold, batch_size=_config.BATCH_SIZE, seq_length=_config.SEQ_LENGTH):
+    """為一個 fold 建立 train / val DataLoader (train 可 shuffle，因為每筆樣本內部的時間順序固定)。"""
+    Xs = fold['X_scaled']
+    train_loader = DataLoader(WindowDataset(Xs, Y, fold['train_pos'], seq_length), batch_size=batch_size, shuffle=True)
+    val_loader = DataLoader(WindowDataset(Xs, Y, fold['val_pos'], seq_length), batch_size=batch_size, shuffle=False)
+    return train_loader, val_loader
+
+
+def month_end_positions(X, positions):
+    """從一組位置中挑出每個日曆月的最後一個交易日 (作為決策日)。"""
+    dates = X.index[positions]
+    is_last = pd.Series(positions, index=dates).groupby(dates.to_period('M')).last()
+    return is_last.values
+
 
 if __name__ == "__main__":
-    # 1. 讀取乾淨的歷史資料
     df = pd.read_csv("etf_adj_close_clean.csv", index_col="Date", parse_dates=True)
-    
-    # 2. 執行特徵工程
     X, Y = generate_ml_features(df)
-    
-    # 3. 建立 PyTorch 資料管線
-    # 假設回看過去 60 個交易日 (約一季) 來預測未來 20 個交易日 (約一個月)
-    train_loader, val_loader, test_loader, scaler_mean, scaler_std = prepare_dataloaders(
-        X, Y, seq_length=_config.SEQ_LENGTH, batch_size=_config.BATCH_SIZE
-    )
-    
-    # 4. 測試取出一個 Batch 看看形狀
+
+    print(f"\n✂️ Walk-forward folds (val {_config.WF_VAL_MONTHS} 個月, purge {_config.TARGET_HORIZON} 個樣本):")
+    for name, ts, te in fold_specs(X):
+        fold = make_fold(X, Y, ts, te)
+        flag = "" if len(fold['train_pos']) >= _config.WF_MIN_TRAIN_SAMPLES else "  ⚠️ train 樣本不足，將跳過"
+        print("  " + describe_fold(name, fold, X) + flag)
+
+    # 檢視單一 batch 的形狀
+    name, ts, te = fold_specs(X)[-1]
+    train_loader, val_loader = fold_dataloaders(X, Y, make_fold(X, Y, ts, te))
     for x_batch, y_batch in train_loader:
         print("\n🔍 檢視單一 Batch 的 Tensor 形狀:")
-        print(f"X_batch shape: {x_batch.shape} --> (Batch Size, Sequence Length, Features)")
-        print(f"Y_batch shape: {y_batch.shape} --> (Batch Size, Target ETFs)")
-        break # 只印出第一組
+        print(f"X_batch shape: {tuple(x_batch.shape)} --> (Batch Size, Sequence Length, Features)")
+        print(f"Y_batch shape: {tuple(y_batch.shape)} --> (Batch Size, Target ETFs)")
+        break
