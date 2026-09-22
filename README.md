@@ -24,8 +24,11 @@ rank-IC of +0.11 (t = 2.1) and a Sharpe at the 98th percentile of the same null.
 | 4b | `_4b_ridge_baseline.py` | Ridge regression on the same features, targets and folds; alpha picked by validation MSE |
 | 5 | `_5_strategy_backtest.py` | Stitches each fold's out-of-sample scores into one series and backtests LSTM / ridge / momentum / SPY under identical accounting; per-fold tables |
 | 6 | `_6_diagnostics.py` | Rank-IC by strategy and fold, in-sample vs OOS IC, Sharpe SE and bootstrap CI, random-selection null, seed dispersion, cost sensitivity, and the **mechanical verdict** against `_config.PRE_REGISTRATION` |
+| 7 | `_7_momentum_robustness.py` | Neighbourhood check on the momentum baseline — plateau or lone peak? — judged against `_config.PRE_REGISTRATION_MOMENTUM` |
 
 `main.py` runs them in order (about 6 minutes on a GPU). All parameters live in `_config.py`.
+`pytest tests/` runs 37 tests covering the accounting and the walk-forward split; every expected value
+in them is hand-computed rather than copied from the implementation.
 
 ### Validation design
 
@@ -46,13 +49,16 @@ rank-IC of +0.11 (t = 2.1) and a Sharpe at the 98th percentile of the same null.
 
 ### Walk-forward out-of-sample, 2022-02 to 2026-08 (55 months, net of 10 bps, Sharpe ex-BIL)
 
-| Strategy | Rank-IC (hit rate) | CAGR | Max DD | Sharpe ± SE | Percentile vs random 5-of-13 |
-| :--- | :--- | :--- | :--- | :--- | :--- |
-| Ensemble LSTM | −0.01 (53%) | 8.7% | −23.4% | 0.37 ± 0.47 | 10% |
-| Ridge (same features) | +0.09 (64%) | 9.4% | −18.9% | 0.42 ± 0.47 | 14% |
-| Momentum (3/6/12m, top 5) | +0.11 (67%) | 17.7% | −8.9% | 1.06 ± 0.48 | 98% |
-| SPY | — | 13.9% | −20.3% | 0.66 ± 0.47 | — |
-| Equal-weight 13 ETFs | — | 12.6% | −14.2% | 0.83 ± 0.47 | 84% |
+Every line is net of 10 bps on traded value and carries its average exposure, so that a return
+comparison is not simply a comparison of risk budgets.
+
+| Strategy | Rank-IC (hit rate) | CAGR | Max DD | Sharpe ± SE | Exposure | Percentile vs random 5-of-13 |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| Ensemble LSTM | −0.01 (53%) | 8.7% | −23.4% | 0.37 ± 0.47 | 1.00 | 10% |
+| Ridge (same features) | +0.09 (64%) | 9.3% | −18.9% | 0.41 ± 0.47 | 1.00 | 14% |
+| Momentum (3/6/12m, top 5) | +0.11 (67%) | 17.7% | −8.9% | 1.06 ± 0.48 | 0.96 | 98% |
+| SPY | — | 13.9% | −20.3% | 0.66 ± 0.47 | 1.00 | — |
+| Equal-weight 13 ETFs | — | 12.6% | −14.2% | 0.83 ± 0.47 | 1.00 | 84% |
 
 ### Per fold: the LSTM memorises its training period and forgets it out of sample
 
@@ -61,7 +67,7 @@ rank-IC of +0.11 (t = 2.1) and a Sharpe at the 98th percentile of the same null.
 | 2022 | 166 | +0.90 | −0.07 | −0.18 / 0.08 / 0.02 / −0.32 |
 | 2023 | 418 | +0.82 | −0.06 | −0.18 / −0.16 / 0.10 / 1.06 |
 | 2024 | 669 | +0.86 | +0.18 | 1.40 / 1.22 / 1.78 / 1.78 |
-| 2025 | 919 | +0.84 | −0.04 | 0.85 / 0.85 / 3.29 / 1.08 |
+| 2025 | 919 | +0.84 | −0.04 | 0.85 / 0.85 / 3.28 / 1.08 |
 | 2026 (Jan–Aug) | 1169 | +0.77 | −0.09 | 0.69 / 0.71 / 0.47 / 0.94 |
 
 ### Pre-registered verdict (computed by `_6_diagnostics.py`)
@@ -75,6 +81,41 @@ rank-IC of +0.11 (t = 2.1) and a Sharpe at the 98th percentile of the same null.
 
 ![diagnostics](diagnostics_report.png)
 
+### Is the momentum baseline itself just a lucky parameter?
+
+Once the LSTM is ruled out, momentum is the only signal holding up any conclusion here — and its
+63/126/252 windows and top-5 were inherited, never checked. `_7_momentum_robustness.py` rescales the
+window triple by 0.5×–2× and varies TOP_N over 3–7, giving a 30-cell grid evaluated on the same 55
+months under the same accounting.
+
+| | Top 3 | Top 4 | Top 5 | Top 6 | Top 7 |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| ×0.50 | 0.58 | 0.78 | 1.05 | 1.11 | 1.07 |
+| ×0.75 | 0.89 | 0.95 | 0.88 | 1.14 | 1.16 |
+| **×1.00** | 0.95 | 0.90 | **1.06** | 0.94 | 0.97 |
+| ×1.25 | 0.98 | 0.90 | 0.91 | 1.19 | 1.13 |
+| ×1.50 | 0.97 | 0.90 | 0.80 | 0.79 | 1.00 |
+| ×2.00 | 0.91 | 0.66 | 0.59 | 0.50 | 0.55 |
+
+Grid Sharpe spans 0.50–1.19, a range of 1.5 SE. The current setting is **not a lone peak**: it sits
+0.33 SE above the mean of its four neighbours, well inside the 1 SE spike-veto threshold, so the
+"momentum works" conclusion is not an artefact of parameter choice. Criterion C (inferior) is not
+triggered either, which under the pre-registration **forbids** proposing any replacement.
+
+Criterion A and criterion E disagreed, and the pre-registration had already decided how to resolve it.
+The base cell's quantised percentile is 77%, two points outside the 25–75% plateau band — but the grid
+has 30 cells, so one cell is worth 3.3% and the threshold falls between steps. The unquantised
+cross-check, (base − grid median) ÷ SE = **+0.29**, is well inside the 0.5 SE materiality threshold.
+Per the pre-registered tie-break the unquantised reading wins: **no material difference, keep
+63/126/252 × top 5.** Reporting the contradiction is part of the result.
+
+Two caveats that the aggregate hides. Per fold, the base cell is inside the plateau band in only 3 of
+5 folds (87th percentile in 2023, 80th in 2024). And there is one genuine gradient rather than noise:
+the ×2.00 row (126/252/504 days) is uniformly the worst, so very long lookbacks do degrade — the
+plateau has an edge, and the current setting is not on it.
+
+![momentum robustness](momentum_robustness.png)
+
 ### What this means
 
 * The model has 36,685 parameters and, in the first fold, 166 overlapping daily samples (about 8 independent months).
@@ -84,6 +125,11 @@ rank-IC of +0.11 (t = 2.1) and a Sharpe at the 98th percentile of the same null.
   20-day horizon; a deeper model does not create signal that is not there.
 * The momentum baseline is the only signal with a positive, borderline-significant OOS rank-IC. Its Sharpe advantage
   over SPY is one standard error and should be read as "consistent with a modest momentum premium", not as proof.
+* The momentum edge survives its own robustness check, but that check is weak by construction: the 30
+  cells share the same 55 months, so their spread understates the true uncertainty. It can say the
+  setting is not anomalous within the grid; it cannot say the Sharpe is reliable. That question is
+  answered by the ±0.48 standard error and the 98th null percentile above, and the honest reading of
+  those is "consistent with a modest momentum premium", not proof.
 * The single-split result reported in earlier versions of this README (12-month OOS, Sharpe 2.93, MDD −3.6%) came
   from a strong bull market in which random 5-of-13 portfolios had a median Sharpe of 2.8, from a strategy whose
   Sharpe SE was ±1.2, and from a pipeline that deleted cash months, used no transaction costs, and had no purge
@@ -98,6 +144,8 @@ rank-IC of +0.11 (t = 2.1) and a Sharpe at the 98th percentile of the same null.
   would be selection, so it stays.
 * yfinance adjusted closes are revised with each distribution, so re-runs reproduce the numbers only to a few
   decimal places.
+* The 13 ETFs, the 20-day target horizon, the 10 bps cost and the monthly rebalance are all fixed
+  assumptions that have not been varied. Only the momentum windows and TOP_N have been stress-tested.
 
 ## Getting started
 
@@ -106,12 +154,25 @@ pip install -r requirements.txt
 python main.py
 ```
 
+```bash
+pytest tests/ -q
+```
+
 Model weights are written to `saved_models/<fold>/` and are not tracked in git. Outputs in the repo root:
 `baseline_vs_spy_performance.png`, `ml_vs_baseline_performance.png`, `diagnostics_report.png`,
-`oos_monthly_returns.csv`, `diagnostics_summary.csv`, `diagnostics_ic_monthly.csv`, `diagnostics_ic_by_fold.csv`.
+`momentum_robustness.png`, `oos_monthly_returns.csv`, `diagnostics_summary.csv`,
+`diagnostics_ic_monthly.csv`, `diagnostics_ic_by_fold.csv`, `momentum_grid_*.csv`.
 
-To change the experiment, edit `_config.py`. If you change anything the pre-registration forbids (sequence length,
-hidden size, epochs, learning rate, fold boundaries, universe), also change `PRE_REGISTRATION` so the diff records it.
+To change the experiment, edit `_config.py`. If you change anything a pre-registration forbids (sequence length,
+hidden size, epochs, learning rate, fold boundaries, universe, momentum windows), also change the corresponding
+`PRE_REGISTRATION*` string so the diff records it.
+
+### Accounting notes
+
+Two things that are easy to get wrong and silently flatter the results, both covered by tests:
+turnover is measured against the **drifted** weights, not by diffing target weights (otherwise a
+constant-weight benchmark appears to trade for free), and max drawdown clips the running peak at the
+initial capital (otherwise a loss in the opening month is invisible).
 
 ## Model
 
