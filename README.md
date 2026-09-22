@@ -11,7 +11,12 @@ that the answer is decided by pre-registered criteria computed by code, not by r
 **Answer (walk-forward, 2022-02 to 2026-08, 55 months): no.** The LSTM has no detectable out-of-sample ranking
 ability (monthly rank-IC −0.01, t = −0.16), is not better than a ridge regression on the same features, and its
 net-of-cost Sharpe sits at the 10th percentile of random 5-of-13 selection. Simple 3/6/12-month momentum has a
-rank-IC of +0.11 (t = 2.1) and a Sharpe at the 98th percentile of the same null. Details below.
+rank-IC of +0.11 (t = 2.1) and a Sharpe at the 98th percentile of the same null.
+
+Three pre-registered rounds have now been run, each committed and pushed before it was executed:
+**round 1** rejected the ensemble LSTM, **round 2** confirmed the momentum baseline is a plateau rather
+than a lucky parameter, and **round 3** rejected a pooled cross-sectional LightGBM that was built
+specifically to fix the LSTM's structural flaw. Details below.
 
 ## What the pipeline does
 
@@ -25,6 +30,8 @@ rank-IC of +0.11 (t = 2.1) and a Sharpe at the 98th percentile of the same null.
 | 5 | `_5_strategy_backtest.py` | Stitches each fold's out-of-sample scores into one series and backtests LSTM / ridge / momentum / SPY under identical accounting; per-fold tables |
 | 6 | `_6_diagnostics.py` | Rank-IC by strategy and fold, in-sample vs OOS IC, Sharpe SE and bootstrap CI, random-selection null, seed dispersion, cost sensitivity, and the **mechanical verdict** against `_config.PRE_REGISTRATION` |
 | 7 | `_7_momentum_robustness.py` | Neighbourhood check on the momentum baseline — plateau or lone peak? — judged against `_config.PRE_REGISTRATION_MOMENTUM` |
+| 4c | `_4c_pooled_gbdt.py` | Pooled (date, asset) representation with no asset identity; LightGBM and a pooled ridge on the same rows |
+| 8 | `_8_pooled_diagnostics.py` | Verdict for the pooled round against `_config.PRE_REGISTRATION_POOLED`; the bar is plain momentum |
 
 `main.py` runs them in order (about 6 minutes on a GPU). All parameters live in `_config.py`.
 `pytest tests/` runs 37 tests covering the accounting and the walk-forward split; every expected value
@@ -116,6 +123,51 @@ plateau has an edge, and the current setting is not on it.
 
 ![momentum robustness](momentum_robustness.png)
 
+### Round 3: does a pooled cross-sectional representation rescue ML?
+
+The LSTM's output layer has one head per ETF, so it carries per-asset parameters and can memorise asset
+identity — which is what in-sample IC of 0.77–0.90 against ~zero OOS IC looks like. Round 3 tests a
+structural fix rather than another model: stack the data as (date, asset) rows whose features are only
+the asset's own momentum/vol, its cross-sectional z-scores that day, and the shared macro pair. **No
+asset identity, no one-hot, no embedding.** 20,228 rows instead of 1,556, and the model can only learn
+a general rule. LightGBM, shallow and heavily regularised, hyper-parameters fixed in advance; a pooled
+ridge on identical rows is the linear baseline.
+
+The pre-registration set the bar at **plain momentum**, not the already-rejected LSTM, and recorded
+beforehand that the ranking component of momentum is only worth +0.19 Sharpe (0.40 SE) — the ceiling
+this round was competing for.
+
+| | OOS rank-IC | t | Hit | Sharpe ± SE | Null percentile |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| Pooled GBDT | +0.063 | 1.22 | 56% | 0.46 ± 0.47 | 19% |
+| Pooled ridge (baseline) | +0.130 | 2.55 | 65% | 0.78 ± 0.47 | 78% |
+| Momentum | +0.108 | 2.12 | 67% | 1.06 ± 0.48 | 98% |
+| LSTM (round 1) | −0.009 | −0.16 | 53% | 0.37 ± 0.47 | 10% |
+
+| Criterion | Rule | Result |
+| :--- | :--- | :--- |
+| A — predictive power | OOS rank-IC mean > 0 and t > 2 | **Fails** (+0.063, t 1.22) |
+| B — vs pooled ridge | paired t of (GBDT − ridge) IC > 2 | **Fails** (t −1.89; the linear model is better) |
+| C — vs plain momentum | paired t of (GBDT − momentum) IC > 2 | **Fails** (t −0.93) |
+| D — strategy level | ΔSharpe ≥ 1 SE and null percentile ≥ 95% | **Fails** (−0.61 vs SE 0.47; 19th percentile) |
+| E — consistency | per-fold reported | GBDT beats momentum on IC in 2 of 5 folds |
+| F — materiality | improvement ≥ 0.5 SE | 1.30 SE — material, but in the **wrong direction** |
+
+The gradient boosting failed in a specific and legible way: in 2 of the 5 folds early stopping halted
+at iteration 1, meaning the first tree already failed to improve validation error, and across the
+round it scored *below its own linear baseline*. That is the textbook small-sample signature — the
+model added variance, not signal.
+
+The representation change itself was not useless: the same ridge went from IC +0.095 non-pooled to
++0.130 pooled, and pooled ridge is the only model in this repo whose IC t-statistic clears 2. But two
+things stop that from being a finding. Its paired t against non-pooled ridge is only +0.62, and its
+paired t against plain momentum is +0.52 — both noise. And its monthly IC correlates 0.67 with
+momentum's, i.e. **it largely rediscovered momentum**, at a strictly worse portfolio Sharpe (0.78 vs
+1.06). Adopting it on the strength of one favourable number would be exactly the post-hoc selection
+the protocol exists to prevent; it would need its own pre-registered round.
+
+![pooled](pooled_report.png)
+
 ### What this means
 
 * The model has 36,685 parameters and, in the first fold, 166 overlapping daily samples (about 8 independent months).
@@ -146,6 +198,9 @@ plateau has an edge, and the current setting is not on it.
   decimal places.
 * The 13 ETFs, the 20-day target horizon, the 10 bps cost and the monthly rebalance are all fixed
   assumptions that have not been varied. Only the momentum windows and TOP_N have been stress-tested.
+* Three model families have now been rejected on the same 55 months. That is evidence about this
+  sample, not a general claim about machine learning on ETF rotation. With SE 0.48, a true edge of
+  0.3 Sharpe would very likely go undetected here.
 
 ## Getting started
 
