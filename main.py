@@ -13,7 +13,8 @@ def run_pipeline():
         "_4_lstm_model.py",           # 每個 fold 訓練一組 Ensemble LSTM
         "_4b_ridge_baseline.py",      # 同特徵的 ridge 線性基準
         "_5_strategy_backtest.py",    # 樣本外回測與繪圖 (LSTM / ridge / 動能 / SPY)
-        "_6_diagnostics.py"           # 預測力 (IC)、統計不確定性、null 比較、依 pre-registration 判定
+        "_6_diagnostics.py",          # 預測力 (IC)、統計不確定性、null 比較、依 pre-registration 判定
+        "_7_momentum_robustness.py"   # 動能基準的鄰域檢查：高原還是孤峰
     ]
 
     print("🚀 開始執行量化交易全自動化管線 (Auto-Trading Pipeline)...")
@@ -50,7 +51,7 @@ def run_pipeline():
     total_elapsed_time = time.time() - total_start_time
     print("\n" + "=" * 60)
     print(f"🎉 專案全線執行完畢！總耗時: {total_elapsed_time / 60:.2f} 分鐘")
-    print("📊 請檢查資料夾內生成的圖表 (baseline_vs_spy_performance.png, ml_vs_baseline_performance.png, diagnostics_report.png) 與 模型權重檔 (saved_models/<fold>/*.pth)。")
+    print("📊 請檢查資料夾內生成的圖表 (baseline_vs_spy_performance.png, ml_vs_baseline_performance.png, diagnostics_report.png, momentum_robustness.png) 與 模型權重檔 (saved_models/<fold>/*.pth)。")
     print("=" * 60)
 
 if __name__ == "__main__":

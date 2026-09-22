@@ -222,3 +222,6 @@ saved_models/
 
 # 編輯器
 .vscode/
+
+# pytest
+.pytest_cache/

@@ -1,12 +1,13 @@
 """
 基準動能策略回測模組：計算動能特徵、執行傳統動能排名邏輯、向量化回測，並與 SPY 基準進行績效比較。
 
-- 動能特徵計算：3個月、6個月、12個月的滾動報酬率，並綜合成一個動能分數。
+- 動能特徵計算：_config.MOM_WINDOWS 各窗口滾動報酬率的等權平均。
 - 回測邏輯：每月底選取分數最高的前 N 強，分數 <= min_score 的槽位改持 fallback（預設現金），其餘等權。
 - 會計口徑（_5 與 _6 共用同一套函式，確保三條線可比）：
     * 現金月（權重全 0）計 0% 報酬，不從序列中刪除；「尚無有效訊號」的月份才剔除。
     * 若資料最後一天不是該月最後一個營業日，該月視為不完整並剔除。
-    * 交易成本 = 每個持有月的成交金額比例 Σ|Δw| × COST_BPS（首月建倉算全額）。
+    * 交易成本 = 每個持有月的成交金額比例 Σ|目標權重 − 漂移後權重| × COST_BPS（首月建倉算全額）。
+      跟漂移比而非直接 diff 目標權重，否則會低估「目標權重穩定」那幾條線（等權、buy & hold）的成本。
     * Sharpe 以扣除 RF_TICKER 月報酬後的超額報酬計算，並附 Lo (2002) 的 iid 標準誤。
 - 最終將策略與 SPY 的月報酬率合併存檔，供 ML 模型對比使用。
 """
@@ -36,18 +37,15 @@ def month_end_returns(df):
 # ==========================================
 # 2. 動能特徵
 # ==========================================
-def calculate_momentum_features(df):
+def calculate_momentum_features(df, windows=None, verbose=True):
     """
-    計算絕對動能指標：3個月(63天)、6個月(126天)、12個月(252天)滾動報酬率
+    絕對動能分數 = 各回看窗口滾動報酬率的等權平均 (預設 _config.MOM_WINDOWS = 63/126/252 天)。
+    多個窗口平均是為了平滑單一週期的極端值；窗口本身是否坐在高原上由 _7_momentum_robustness.py 檢驗。
     """
-    print("⚙️ 計算動能特徵中...")
-    mom_3m = df.pct_change(63)
-    mom_6m = df.pct_change(126)
-    mom_12m = df.pct_change(252)
-
-    # 綜合動能分數：這裡採用 3M, 6M, 12M 的平均，平滑單一週期的極端值
-    mom_score = (mom_3m*1 + mom_6m*1 + mom_12m*1) / 3
-    return mom_score
+    windows = list(_config.MOM_WINDOWS if windows is None else windows)
+    if verbose:
+        print(f"⚙️ 計算動能特徵中 (窗口 {windows} 天)...")
+    return sum(df.pct_change(w) for w in windows) / len(windows)
 
 
 # ==========================================
@@ -83,12 +81,47 @@ def build_weights(score_df, top_n, min_score=0.0, fallback=None):
     return weights
 
 
-def traded_fraction(weights):
-    """每個決策日的成交金額比例 Σ|Δw|，首月建倉算全額。"""
+def drifted_weights(prev_weights, month_return):
+    """
+    上個決策日的目標權重，經過一個月的報酬漂移後的實際權重。
+    未投資的部分視為現金 (0% 報酬)，仍佔總市值，所以分母含它。
+    """
+    grown = prev_weights * (1 + month_return)
+    total = grown.sum() + (1 - prev_weights.sum())     # 資產市值 + 現金
+    return grown / total if total else grown
+
+
+def traded_fraction(weights, monthly_returns):
+    """
+    每個決策日的成交金額比例 Σ|目標權重 − 漂移後權重|，首月建倉算全額。
+
+    ⚠️ 必須跟漂移比，不能直接 diff 目標權重：等權組合的目標權重每月相同，
+    diff 會得到 0，但實際上每月再平衡都要把漲多的賣掉、跌多的買回。
+    用 diff 會系統性低估「目標權重穩定」那幾條線的成本 (等權、buy & hold)。
+    """
     wv = weights.dropna(how='all')
-    traded = wv.diff().abs().sum(axis=1)
+    cols = wv.columns.intersection(monthly_returns.columns)
+    traded = pd.Series(np.nan, index=wv.index)
     traded.iloc[0] = wv.iloc[0].abs().sum()
+
+    for prev_date, date in zip(wv.index[:-1], wv.index[1:]):
+        # 決策日 prev_date 的權重，持有到決策日 date 為止 (即 date 當月的報酬)
+        r = monthly_returns.loc[date, cols] if date in monthly_returns.index else None
+        if r is None:
+            traded.loc[date] = wv.loc[date, cols].sub(wv.loc[prev_date, cols]).abs().sum()
+            continue
+        drift = drifted_weights(wv.loc[prev_date, cols], r)
+        traded.loc[date] = wv.loc[date, cols].sub(drift).abs().sum()
     return traded
+
+
+def constant_weights(assets, index, weight=None):
+    """
+    固定目標權重的 benchmark (等權組合、buy & hold) 的權重矩陣，
+    讓它們跟策略走同一套會計 (含再平衡換手成本)。weight 省略時為等權。
+    """
+    w = 1.0 / len(assets) if weight is None else weight
+    return pd.DataFrame(w, index=index, columns=list(assets))
 
 
 def backtest_momentum_strategy(df, score_df, top_n, min_score=0.0, fallback=None, cost_bps=0.0):
@@ -103,7 +136,7 @@ def backtest_momentum_strategy(df, score_df, top_n, min_score=0.0, fallback=None
     w = weights.reindex(monthly_returns.index).shift(1)      # 決策日 -> 持有月
     cols = w.columns.intersection(monthly_returns.columns)
     gross = (w[cols] * monthly_returns[cols]).sum(axis=1, min_count=1)   # 現金月 = 0, 無決策 = NaN
-    traded = traded_fraction(weights).reindex(monthly_returns.index).shift(1)
+    traded = traded_fraction(weights, monthly_returns).reindex(monthly_returns.index).shift(1)
     net = gross - traded * cost_bps / 1e4
     return net.dropna(), weights
 
@@ -111,27 +144,37 @@ def backtest_momentum_strategy(df, score_df, top_n, min_score=0.0, fallback=None
 # ==========================================
 # 4. 績效指標
 # ==========================================
-def performance_metrics(returns, rf=None):
+def performance_metrics(returns, rf=None, weights=None):
     """
     CAGR、最大回撤、年化 Sharpe 及其標準誤 (Lo 2002 的 iid 近似)。
     rf 給定時 (月頻序列)，Sharpe 以超額報酬計算。
+    weights 給定時附上「平均曝險」與「每單位曝險的 CAGR」——報酬比較沒有並列曝險是套套邏輯
+    (曝險高賺得多不是發現)。
     """
     r = returns.dropna()
     cum = (1 + r).cumprod()
     cagr = cum.iloc[-1] ** (12 / len(r)) - 1
-    mdd = (cum / cum.cummax() - 1).min()
+    # ⚠️ cummax() 從第一個月的淨值起算，若第一個月就虧損，那段回撤會看不見。
+    #    期初本金 1.0 本身就是一個峰值，所以下限要夾在 1.0。
+    mdd = (cum / cum.cummax().clip(lower=1.0) - 1).min()
     ex = r if rf is None else (r - rf.reindex(r.index)).dropna()
     sr_m = ex.mean() / ex.std(ddof=1)
-    return {'n': len(r), 'CAGR': cagr, 'MDD': mdd,
-            'Sharpe': sr_m * np.sqrt(12),
-            'Sharpe_SE': np.sqrt((1 + 0.5 * sr_m ** 2) / len(ex)) * np.sqrt(12)}
+    out = {'n': len(r), 'CAGR': cagr, 'MDD': mdd,
+           'Sharpe': sr_m * np.sqrt(12),
+           'Sharpe_SE': np.sqrt((1 + 0.5 * sr_m ** 2) / len(ex)) * np.sqrt(12)}
+    if weights is not None:
+        # 持有月 t 的曝險由決策日 t-1 的權重決定
+        exposure = weights.sum(axis=1).reindex(r.index - pd.offsets.MonthEnd(1))
+        out['Exposure'] = float(exposure.mean())
+        out['CAGR_per_exposure'] = cagr / out['Exposure'] if out['Exposure'] else np.nan
+    return out
 
 
 def calculate_performance_metrics(returns, name="Strategy", rf=None):
     """印出核心績效指標並回傳 (資金曲線, 回撤曲線)。"""
     m = performance_metrics(returns, rf)
     cum_returns = (1 + returns).cumprod()
-    drawdown = cum_returns / cum_returns.cummax() - 1
+    drawdown = cum_returns / cum_returns.cummax().clip(lower=1.0) - 1
 
     print(f"--- {name} ({m['n']} 個月) ---")
     print(f"年化報酬率 (CAGR): {m['CAGR']:.2%}")

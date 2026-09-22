@@ -21,7 +21,8 @@ from scipy.stats import spearmanr
 
 import _config
 from _2_baseline_performance import (calculate_momentum_features, backtest_momentum_strategy,
-                                     month_end_returns, traded_fraction, performance_metrics as perf)
+                                     month_end_returns, traded_fraction, constant_weights,
+                                     performance_metrics as perf)
 from _3_ml_data_pipeline import generate_ml_features
 from _4b_ridge_baseline import ridge_scores
 from _5_strategy_backtest import usable_folds, generate_ml_scores, fold_of_holding_month
@@ -109,7 +110,7 @@ def random_selection_null(R, rf, top_n, n_sims, rng, cost_bps=0.0):
         ex = rs - rf
         out[i] = [ex.mean() / ex.std(ddof=1) * np.sqrt(12),
                   cum[-1] ** (12 / T) - 1,
-                  (cum / np.maximum.accumulate(cum) - 1).min()]
+                  (cum / np.maximum(np.maximum.accumulate(cum), 1.0) - 1).min()]
     return pd.DataFrame(out, columns=['Sharpe', 'CAGR', 'MDD'])
 
 
@@ -260,23 +261,34 @@ if __name__ == "__main__":
     oos_idx = oos_idx.intersection(ridge_g.index).intersection(base_g.index)
 
     def net(gross, weights):
-        traded = traded_fraction(weights).reindex(month_ret.index).shift(1)
+        traded = traded_fraction(weights, month_ret).reindex(month_ret.index).shift(1)
         return (gross - traded * _config.COST_BPS / 1e4).reindex(oos_idx)
+
+    # Benchmark 也走同一套會計：等權每月再平衡有真實換手 (漂移再平衡)，SPY buy & hold 幾乎沒有。
+    # 若 benchmark 報毛報酬而策略報淨報酬，比較就偏向 benchmark。
+    decision_dates = base_w.dropna(how='all').index
+    ew_w = constant_weights(assets, decision_dates)
+    spy_w = constant_weights(['SPY'], decision_dates, weight=1.0)
+    with quiet():
+        ew_g = (ew_w.reindex(month_ret.index).shift(1) * month_ret[assets]).sum(axis=1, min_count=1).dropna()
+        spy_g = month_ret['SPY'].reindex(ew_g.index)
 
     series = {
         'LSTM ensemble': net(ml_g, ml_w),
         'Ridge (linear)': net(ridge_g, ridge_w),
         'Momentum': net(base_g, base_w),
-        'SPY': month_ret['SPY'].reindex(oos_idx),
-        f'Equal-weight {len(assets)} ETFs': month_ret[assets].mean(axis=1).reindex(oos_idx),
+        'SPY': net(spy_g, spy_w),
+        f'Equal-weight {len(assets)} ETFs': net(ew_g, ew_w),
     }
+    weights_of = {'LSTM ensemble': ml_w, 'Ridge (linear)': ridge_w, 'Momentum': base_w,
+                  'SPY': spy_w, f'Equal-weight {len(assets)} ETFs': ew_w}
     cash_months = int((ml_g.reindex(oos_idx) == 0).sum())
     print(f"\n💰 OOS 持有月數 {len(oos_idx)} ({oos_idx[0].strftime('%Y-%m')} ~ {oos_idx[-1].strftime('%Y-%m')})，"
           f"LSTM 空手月 {cash_months} 個。")
 
     rows = []
     for name, r in series.items():
-        m = perf(r, rf=rf_m)
+        m = perf(r, rf=rf_m, weights=weights_of[name])
         lo, hi = bootstrap_sharpe_ci(r - rf_m.reindex(r.index), _config.N_BOOTSTRAP, rng)
         rows.append({'strategy': name, **m, 'Sharpe_CI95_lo': lo, 'Sharpe_CI95_hi': hi, 'Sharpe_raw': perf(r)['Sharpe']})
     perf_tab = pd.DataFrame(rows).set_index('strategy')
@@ -326,9 +338,11 @@ if __name__ == "__main__":
     print("\n" + "-" * 60)
     print("💸 (5) 換手率與交易成本敏感度 (OOS；成本 = 成交金額 × bps；Sharpe 扣 rf)")
     print("-" * 60)
-    traded = {name: traded_fraction(w).reindex(month_ret.index).shift(1).reindex(oos_idx)
-              for name, w in [('LSTM ensemble', ml_w), ('Ridge (linear)', ridge_w), ('Momentum', base_w)]}
-    gross = {'LSTM ensemble': ml_g.reindex(oos_idx), 'Ridge (linear)': ridge_g.reindex(oos_idx), 'Momentum': base_g.reindex(oos_idx)}
+    traded = {name: traded_fraction(w, month_ret).reindex(month_ret.index).shift(1).reindex(oos_idx)
+              for name, w in [('LSTM ensemble', ml_w), ('Ridge (linear)', ridge_w), ('Momentum', base_w),
+                              (f'Equal-weight {len(assets)} ETFs', ew_w)]}
+    gross = {'LSTM ensemble': ml_g.reindex(oos_idx), 'Ridge (linear)': ridge_g.reindex(oos_idx),
+             'Momentum': base_g.reindex(oos_idx), f'Equal-weight {len(assets)} ETFs': ew_g.reindex(oos_idx)}
     print("   平均單邊月換手: " + " | ".join(f"{k} {v.mean() / 2:.1%}" for k, v in traded.items()))
     cost_rows = []
     for bps in _config.COST_GRID_BPS:

@@ -175,7 +175,7 @@ if __name__ == "__main__":
     for name, r in series.items():
         color, ls, lw = styles[name]
         cum = (1 + r).cumprod()
-        dd = cum / cum.cummax() - 1
+        dd = cum / cum.cummax().clip(lower=1.0) - 1
         ax1.plot(cum.index, cum.values, label=name, color=color, linestyle=ls, linewidth=lw)
         ax2.plot(dd.index, dd.values, label=name, color=color, linestyle=ls, linewidth=lw)
     ax1.set_title(f'Walk-forward out-of-sample equity ({oos_index[0].year}-{oos_index[-1].year}, net of {_config.COST_BPS} bps)', loc='left')
